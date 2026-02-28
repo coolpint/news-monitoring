@@ -1156,7 +1156,7 @@ async function runPoll(env, triggerType) {
 
     const pendingRows = await db.prepare(
       `SELECT n.id AS notification_id, n.channel_id,
-              a.title, a.url, a.published_at,
+              a.title, a.url, a.published_at, a.publisher_name, a.publisher_domain,
               k.label AS keyword_label, k.query, k.exclude_terms,
               c.type, c.webhook_url,
               u.name AS user_name
@@ -1902,8 +1902,9 @@ async function sendTelegramWebhook(webhookUrl, batch) {
   const bodyText = batch
     .map((item, idx) => {
       const stamp = item.published_at ? ` (${new Date(item.published_at).toLocaleString("ko-KR")})` : "";
-      const keywordLabel = item.keyword_path || item.keyword_label;
-      return `${idx + 1}. [${keywordLabel}] ${item.title}${stamp}\n${item.url}`;
+      const topicLabel = extractTopTopicLabel(item.keyword_path, item.keyword_label);
+      const publisher = collapseSpace(String(item.publisher_name || item.publisher_domain || "매체미상"));
+      return `${idx + 1}. [${topicLabel}] ${item.title}${stamp}\n매체: ${publisher}\n${item.url}`;
     })
     .join("\n\n");
 
@@ -2027,6 +2028,15 @@ function buildKeywordPath(topicLabel, keywordLabel) {
     return `${topic}>${keyword}`;
   }
   return topic || keyword;
+}
+
+function extractTopTopicLabel(keywordPath, fallbackLabel) {
+  const path = collapseSpace(String(keywordPath || ""));
+  if (path) {
+    const top = collapseSpace(path.split(">")[0] || "");
+    if (top) return top;
+  }
+  return collapseSpace(String(fallbackLabel || ""));
 }
 
 function normalizeSearchTermsInput(searchTerms, queryFallback) {
