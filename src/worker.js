@@ -487,10 +487,10 @@ async function diagnoseKeyword(env, user, keywordId) {
   let tierPassed = 0;
   let searchPassed = 0;
   let mustPassed = 0;
-  let excludePassed = 0;
+  const finalPassedArticles = [];
 
   const samples = [];
-  for (const article of merged.slice(0, 30)) {
+  for (const article of merged) {
     let reason = "pass";
     if (!matchesTierFilter(article, keywordConfig.tierFilters, tierLookup)) {
       reason = "filtered_by_tier";
@@ -507,18 +507,80 @@ async function diagnoseKeyword(env, user, keywordId) {
           if (isExcluded(article, keywordConfig.excludeTerms)) {
             reason = "filtered_by_exclude";
           } else {
-            excludePassed += 1;
+            finalPassedArticles.push(article);
           }
         }
       }
     }
 
-    samples.push({
-      title: article.title,
-      url: article.url,
-      publisher: article.publisherName || article.publisherDomain || "",
-      reason,
-    });
+    if (samples.length < 30) {
+      samples.push({
+        title: article.title,
+        url: article.url,
+        publisher: article.publisherName || article.publisherDomain || "",
+        reason,
+      });
+    }
+  }
+
+  const channelsRes = await env.DB.prepare(
+    `SELECT id, name, type, active
+     FROM channels
+     WHERE user_id = ?
+     ORDER BY created_at DESC`,
+  )
+    .bind(row.user_id)
+    .all();
+  const channels = (channelsRes.results || []).map((ch) => ({
+    id: ch.id,
+    name: ch.name,
+    type: ch.type,
+    active: Number(ch.active) === 1,
+  }));
+  const activeChannelIds = channels.filter((ch) => ch.active).map((ch) => ch.id);
+
+  const finalArticleIds = [];
+  const seenArticleIds = new Set();
+  for (const article of finalPassedArticles) {
+    const articleId = await buildArticleId(article, keywordConfig.compiledQuery);
+    if (seenArticleIds.has(articleId)) continue;
+    seenArticleIds.add(articleId);
+    finalArticleIds.push(articleId);
+  }
+
+  let potentialNewNotifications = 0;
+  let potentialNewArticles = 0;
+
+  if (activeChannelIds.length && finalArticleIds.length) {
+    const articlePlaceholders = finalArticleIds.map(() => "?").join(", ");
+    const channelPlaceholders = activeChannelIds.map(() => "?").join(", ");
+    const existingRes = await env.DB.prepare(
+      `SELECT article_id, channel_id
+       FROM notifications
+       WHERE keyword_id = ?
+         AND article_id IN (${articlePlaceholders})
+         AND channel_id IN (${channelPlaceholders})`,
+    )
+      .bind(row.id, ...finalArticleIds, ...activeChannelIds)
+      .all();
+
+    const existingPairs = new Set(
+      (existingRes.results || []).map((x) => `${x.article_id}::${x.channel_id}`),
+    );
+
+    for (const articleId of finalArticleIds) {
+      let newForArticle = 0;
+      for (const channelId of activeChannelIds) {
+        const key = `${articleId}::${channelId}`;
+        if (!existingPairs.has(key)) {
+          potentialNewNotifications += 1;
+          newForArticle += 1;
+        }
+      }
+      if (newForArticle > 0) {
+        potentialNewArticles += 1;
+      }
+    }
   }
 
   return jsonResponse({
@@ -539,8 +601,14 @@ async function diagnoseKeyword(env, user, keywordId) {
       tier_passed: tierPassed,
       search_passed: searchPassed,
       must_include_passed: mustPassed,
-      final_passed: excludePassed,
+      final_passed: finalPassedArticles.length,
+      channels_total: channels.length,
+      channels_active: activeChannelIds.length,
+      channels_inactive: Math.max(0, channels.length - activeChannelIds.length),
+      potential_new_articles: potentialNewArticles,
+      potential_new_notifications: potentialNewNotifications,
     },
+    channels,
     samples,
   });
 }
