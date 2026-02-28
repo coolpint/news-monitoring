@@ -128,6 +128,11 @@ GitHub 저장소 `Settings > Secrets and variables > Actions`에 아래 두 개�
 
 - `CLOUDFLARE_API_TOKEN`: Workers/D1 배포 권한이 있는 토큰
 - `CLOUDFLARE_ACCOUNT_ID`: Cloudflare Account ID
+- `D1_DATABASE_ID`: D1 생성 시 출력되는 database id (UUID)
+
+`D1_DATABASE_ID` 확인 방법:
+- `npx wrangler d1 create news_monitoring` 실행 시 출력되는 `database_id` 사용
+- 또는 Cloudflare Dashboard > D1 > 해당 DB > Settings에서 ID 확인
 
 초기 1회는 로컬에서 D1 생성/스키마 적용이 필요하고, 그 이후 코드 변경은 GitHub 푸시로 자동 배포할 수 있습니다.
 
