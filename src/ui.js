@@ -4,6 +4,8 @@ function clientMain() {
     me: null,
     keywords: [],
     channels: [],
+    mediaCatalog: { tiers: [], discovered: [] },
+    mediaSearch: "",
     users: [],
     runs: [],
     notice: null,
@@ -27,6 +29,35 @@ function clientMain() {
       .split(/[\n,]+/)
       .map((term) => term.trim())
       .filter(Boolean);
+  }
+
+  function normalizeTierFilters(value) {
+    const input = Array.isArray(value) ? value : [];
+    const tiers = input
+      .map((v) => Number(v))
+      .filter((v) => Number.isInteger(v) && v >= 1 && v <= 4)
+      .sort((a, b) => a - b);
+    const unique = [];
+    for (const tier of tiers) {
+      if (!unique.includes(tier)) unique.push(tier);
+    }
+    return unique;
+  }
+
+  function displayTierFilters(value) {
+    const tiers = normalizeTierFilters(value);
+    if (!tiers.length || tiers.length === 4) return "전체";
+    return tiers.map((tier) => `T${tier}`).join(", ");
+  }
+
+  function collectKeywordTierFilters() {
+    const selected = [];
+    for (let tier = 1; tier <= 4; tier += 1) {
+      const checkbox = document.getElementById(`kwTier${tier}`);
+      if (checkbox && checkbox.checked) selected.push(tier);
+    }
+    if (!selected.length || selected.length === 4) return [];
+    return selected;
   }
 
   async function api(path, options = {}) {
@@ -91,15 +122,23 @@ function clientMain() {
   }
 
   async function loadData() {
-    const loaders = [api("/api/keywords"), api("/api/channels"), api("/api/poll-runs")];
-    if (state.me.role === "admin") {
-      loaders.push(api("/api/users"));
-    }
-    const [keywords, channels, runs, users] = await Promise.all(loaders);
+    const [keywords, channels, mediaCatalog] = await Promise.all([
+      api("/api/keywords"),
+      api("/api/channels"),
+      api("/api/media-catalog"),
+    ]);
     state.keywords = keywords.keywords || [];
     state.channels = channels.channels || [];
-    state.runs = runs.runs || [];
-    state.users = (users && users.users) || [];
+    state.mediaCatalog = mediaCatalog || { tiers: [], discovered: [] };
+
+    if (state.me.role === "admin") {
+      const [runs, users] = await Promise.all([api("/api/poll-runs"), api("/api/users")]);
+      state.runs = runs.runs || [];
+      state.users = users.users || [];
+    } else {
+      state.runs = [];
+      state.users = [];
+    }
   }
 
   function renderLogin() {
@@ -130,12 +169,14 @@ function clientMain() {
   }
 
   function renderDashboard() {
+    const isAdmin = state.me.role === "admin";
     const keywordRows = state.keywords.map((k) => `
       <tr>
         <td>${esc(k.keyword_path || ((k.topic_label ? `${k.topic_label}>` : "") + (k.label || "")))}</td>
         <td>${(k.search_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${(k.must_include_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${(k.exclude_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
+        <td>${esc(displayTierFilters(k.tier_filters))}</td>
         <td>${k.active ? "ON" : "OFF"}</td>
         <td>
           <div class="btns">
@@ -146,6 +187,37 @@ function clientMain() {
         </td>
       </tr>
     `).join("");
+
+    const tierCards = (state.mediaCatalog.tiers || []).map((tierInfo) => `
+      <div class="tier-card">
+        <div class="tier-head">
+          <span class="tier-dot t${tierInfo.tier}"></span>
+          <strong>${esc(tierInfo.label)}</strong>
+          <span class="muted">${tierInfo.predefined_count}</span>
+        </div>
+        <div class="tier-list">
+          ${(tierInfo.predefined_sources || []).slice(0, 12).map((source) => `<span class="pill">${esc(source)}</span>`).join(" ")}
+          ${(tierInfo.predefined_count || 0) > 12 ? `<span class="muted">+${tierInfo.predefined_count - 12}</span>` : ""}
+        </div>
+      </div>
+    `).join("");
+
+    const mediaSearch = state.mediaSearch.trim().toLowerCase();
+    const discoveredRows = (state.mediaCatalog.discovered || [])
+      .filter((item) => {
+        if (!mediaSearch) return true;
+        const haystack = `${item.name || ""} ${item.publisher_domain || ""}`.toLowerCase();
+        return haystack.includes(mediaSearch);
+      })
+      .slice(0, 120)
+      .map((item) => `
+        <tr>
+          <td>${esc(item.name || "-")}</td>
+          <td>T${item.tier}</td>
+          <td>${esc(item.publisher_domain || "-")}</td>
+          <td>${item.article_count}</td>
+        </tr>
+      `).join("");
 
     const channelRows = state.channels.map((c) => `
       <tr>
@@ -172,7 +244,7 @@ function clientMain() {
       </tr>
     `).join("");
 
-    const userPanel = (state.me.role === "admin" && state.bootstrap.appMode === "multi_user_teams") ? `
+    const userPanel = (isAdmin && state.bootstrap.appMode === "multi_user_teams") ? `
       <section class="card">
         <h2>사용자 관리</h2>
         <table>
@@ -190,12 +262,22 @@ function clientMain() {
       </section>
     ` : "";
 
+    const runPanel = isAdmin ? `
+      <section class="card">
+        <h2>최근 실행</h2>
+        <table>
+          <thead><tr><th>시작</th><th>트리거</th><th>상태</th><th>수집/신규</th><th>성공/실패</th></tr></thead>
+          <tbody>${runRows || "<tr><td colspan='5' class='muted'>실행 기록이 없습니다.</td></tr>"}</tbody>
+        </table>
+      </section>
+    ` : "";
+
     return `
       <section class="card">
         <h2>운영</h2>
         <div class="muted">로그인 사용자: ${esc(state.me.name)} (${esc(state.me.email)})</div>
         <div class="btns" style="margin-top:10px;">
-          <button id="runNowBtn">지금 수집 실행</button>
+          ${isAdmin ? "<button id='runNowBtn'>지금 수집 실행</button>" : ""}
           <button id="refreshBtn" class="ghost">새로고침</button>
           <button id="logoutBtn" class="ghost">로그아웃</button>
         </div>
@@ -207,8 +289,8 @@ function clientMain() {
           <div class="muted" style="margin-bottom:10px;">검색어는 정확 일치로 처리되며 여러 개 입력 시 OR 조건으로 동작합니다.</div>
           <div class="muted" style="margin-bottom:10px;">주제어를 입력하면 알림 라벨이 주제어&gt;검색어 형태로 표시됩니다.</div>
           <table>
-            <thead><tr><th>주제어&gt;검색어</th><th>검색어(OR)</th><th>꼭 포함</th><th>제외</th><th>상태</th><th>관리</th></tr></thead>
-            <tbody>${keywordRows || "<tr><td colspan='6' class='muted'>아직 키워드가 없습니다.</td></tr>"}</tbody>
+            <thead><tr><th>주제어&gt;검색어</th><th>검색어(OR)</th><th>꼭 포함</th><th>제외</th><th>티어</th><th>상태</th><th>관리</th></tr></thead>
+            <tbody>${keywordRows || "<tr><td colspan='7' class='muted'>아직 키워드가 없습니다.</td></tr>"}</tbody>
           </table>
           <div class="row inline" style="margin-top:10px;">
             <div><label>주제어 그룹</label><input id="kwTopic" placeholder="예: 지바이크" /></div>
@@ -216,6 +298,12 @@ function clientMain() {
             <div><label>검색어(쉼표/줄바꿈)</label><input id="kwSearchTerms" placeholder="예: 회사명, 브랜드명" /></div>
             <div><label>꼭 포함(쉼표/줄바꿈)</label><input id="kwMustInclude" placeholder="예: 투자유치, 신제품" /></div>
             <div><label>제외어(쉼표/줄바꿈)</label><input id="kwExclude" placeholder="예: 채용, 공고" /></div>
+          </div>
+          <div class="tier-picks">
+            <label><input id="kwTier1" type="checkbox" checked /> 티어1</label>
+            <label><input id="kwTier2" type="checkbox" checked /> 티어2</label>
+            <label><input id="kwTier3" type="checkbox" checked /> 티어3</label>
+            <label><input id="kwTier4" type="checkbox" checked /> 티어4</label>
           </div>
           <div class="btns"><button id="addKeywordBtn">키워드 추가</button></div>
         </section>
@@ -241,15 +329,20 @@ function clientMain() {
         </section>
       </div>
 
-      ${userPanel}
-
       <section class="card">
-        <h2>최근 실행</h2>
-        <table>
-          <thead><tr><th>시작</th><th>트리거</th><th>상태</th><th>수집/신규</th><th>성공/실패</th></tr></thead>
-          <tbody>${runRows || "<tr><td colspan='5' class='muted'>실행 기록이 없습니다.</td></tr>"}</tbody>
+        <div class="media-head">
+          <h2 style="margin:0;">매체 티어</h2>
+          <input id="mediaSearch" placeholder="매체명/도메인 검색" value="${esc(state.mediaSearch)}" />
+        </div>
+        <div class="tier-grid">${tierCards || "<div class='muted'>티어 정보 없음</div>"}</div>
+        <table style="margin-top:12px;">
+          <thead><tr><th>매체</th><th>티어</th><th>도메인</th><th>수집건수</th></tr></thead>
+          <tbody>${discoveredRows || "<tr><td colspan='4' class='muted'>수집된 매체 데이터가 아직 없습니다.</td></tr>"}</tbody>
         </table>
       </section>
+
+      ${userPanel}
+      ${runPanel}
     `;
   }
 
@@ -330,6 +423,14 @@ function clientMain() {
       });
     }
 
+    const mediaSearchInput = document.getElementById("mediaSearch");
+    if (mediaSearchInput) {
+      mediaSearchInput.addEventListener("input", () => {
+        state.mediaSearch = mediaSearchInput.value;
+        render();
+      });
+    }
+
     const runNowBtn = document.getElementById("runNowBtn");
     if (runNowBtn) {
       runNowBtn.addEventListener("click", async () => {
@@ -356,6 +457,7 @@ function clientMain() {
               searchTerms: parseTermInput(document.getElementById("kwSearchTerms").value),
               mustIncludeTerms: parseTermInput(document.getElementById("kwMustInclude").value),
               excludeTerms: parseTermInput(document.getElementById("kwExclude").value),
+              tierFilters: collectKeywordTierFilters(),
             },
           });
           setNotice("키워드를 추가했습니다.");
@@ -648,6 +750,69 @@ export function renderAppShell() {
         gap: 14px;
         grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
       }
+      .tier-picks {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 14px;
+        margin: 8px 0 12px;
+      }
+      .tier-picks label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font-size: 0.82rem;
+        color: var(--ink);
+        background: #fff;
+      }
+      .tier-picks input {
+        width: auto;
+        margin: 0;
+        accent-color: var(--brand);
+      }
+      .media-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+      .media-head input {
+        max-width: 320px;
+      }
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 10px;
+      }
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 10px;
+        background: #fbfefd;
+      }
+      .tier-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .tier-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+      }
+      .tier-dot.t1 { background: #e85b68; }
+      .tier-dot.t2 { background: #d1a43a; }
+      .tier-dot.t3 { background: #46a8bb; }
+      .tier-dot.t4 { background: #9aa6ac; }
+      .tier-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
       .pill {
         display: inline-flex;
         border: 1px solid var(--line);
@@ -663,7 +828,13 @@ export function renderAppShell() {
       @media (max-width: 720px) {
         .wrap { padding: 16px 10px 38px; }
         .card { padding: 12px; border-radius: 12px; }
-        th:nth-child(4), td:nth-child(4) { display: none; }
+        .media-head {
+          flex-direction: column;
+          align-items: stretch;
+        }
+        .media-head input {
+          max-width: none;
+        }
       }
     </style>
   </head>

@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS articles (
   normalized_url TEXT NOT NULL,
   published_at TEXT,
   summary TEXT,
+  publisher_name TEXT,
+  publisher_domain TEXT,
   first_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

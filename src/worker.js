@@ -4,6 +4,25 @@ const COOKIE_NAME = "nm_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14;
 const DEFAULT_MAX_USERS = 30;
 const DEFAULT_MAX_KEYWORDS_PER_USER = 40;
+const ALL_TIER_VALUES = [1, 2, 3, 4];
+
+const MEDIA_TIER_NAMES = {
+  1: [
+    "조선일보", "중앙일보", "동아일보", "한겨레", "경향신문", "매일경제", "한국경제", "한국일보", "연합뉴스", "KBS", "MBC",
+  ],
+  2: [
+    "머니투데이", "헤럴드경제", "서울경제", "전자신문", "디지털타임스", "국민일보", "문화일보", "서울신문", "세계일보", "TV조선", "MBN",
+  ],
+  3: [
+    "오마이뉴스", "머니S", "매일신문", "아이뉴스24", "프레시안", "더팩트", "비즈워치", "노컷뉴스", "블로터", "미디어오늘", "디지털데일리",
+  ],
+};
+const MEDIA_TIER_DOMAINS = {
+  1: ["chosun.com", "joongang.co.kr", "donga.com", "hani.co.kr", "khan.co.kr", "mk.co.kr", "hankyung.com", "hankookilbo.com", "yna.co.kr", "kbs.co.kr", "mbc.co.kr", "imbc.com"],
+  2: ["mt.co.kr", "heraldcorp.com", "sedaily.com", "etnews.com", "dt.co.kr", "kmib.co.kr", "munhwa.com", "seoul.co.kr", "segye.com", "tvchosun.com", "mbn.co.kr"],
+  3: ["ohmynews.com", "moneys.co.kr", "imaeil.com", "inews24.com", "pressian.com", "tf.co.kr", "bizwatch.co.kr", "nocutnews.co.kr", "bloter.net", "mediatoday.co.kr", "ddaily.co.kr"],
+};
+const MEDIA_TIER_LOOKUP = buildMediaTierLookup();
 
 export default {
   async fetch(request, env, ctx) {
@@ -118,6 +137,10 @@ async function handleRequest(request, env) {
 
   if (path === "/api/poll-runs" && method === "GET") {
     return listPollRuns(env, session.user);
+  }
+
+  if (path === "/api/media-catalog" && method === "GET") {
+    return listMediaCatalog(env);
   }
 
   if (path === "/api/run-now" && method === "POST") {
@@ -268,6 +291,7 @@ async function listKeywords(env, user) {
       search_terms: config.searchTerms,
       must_include_terms: config.mustIncludeTerms,
       exclude_terms: config.excludeTerms,
+      tier_filters: config.tierFilters,
       active: Number(row.active) === 1,
     };
   });
@@ -283,6 +307,7 @@ async function createKeyword(request, env, user) {
   const searchTerms = normalizeSearchTermsInput(body.searchTerms, body.query);
   const mustIncludeTerms = normalizeTermArray(body.mustIncludeTerms);
   const excludeTerms = normalizeTermArray(body.excludeTerms);
+  const tierFilters = normalizeTierFilters(body.tierFilters);
   const query = buildExactOrQuery(searchTerms);
 
   if (!label || !searchTerms.length) {
@@ -315,7 +340,7 @@ async function createKeyword(request, env, user) {
       userId,
       label,
       query,
-      JSON.stringify({ topicLabel, searchTerms, mustIncludeTerms, excludeTerms }),
+      JSON.stringify({ topicLabel, searchTerms, mustIncludeTerms, excludeTerms, tierFilters }),
       source,
     )
     .run();
@@ -357,6 +382,7 @@ async function patchKeyword(request, env, user, keywordId) {
     body.searchTerms !== undefined ||
     body.mustIncludeTerms !== undefined ||
     body.excludeTerms !== undefined ||
+    body.tierFilters !== undefined ||
     body.topicLabel !== undefined
   ) {
     const current = parseKeywordConfig(row);
@@ -372,6 +398,9 @@ async function patchKeyword(request, env, user, keywordId) {
     const nextExcludeTerms = body.excludeTerms !== undefined
       ? normalizeTermArray(body.excludeTerms)
       : current.excludeTerms;
+    const nextTierFilters = body.tierFilters !== undefined
+      ? normalizeTierFilters(body.tierFilters)
+      : current.tierFilters;
 
     if (!nextSearchTerms.length) {
       return jsonResponse({ error: "At least one search term is required" }, 400);
@@ -385,6 +414,7 @@ async function patchKeyword(request, env, user, keywordId) {
       searchTerms: nextSearchTerms,
       mustIncludeTerms: nextMustIncludeTerms,
       excludeTerms: nextExcludeTerms,
+      tierFilters: nextTierFilters,
     }));
   }
 
@@ -609,8 +639,52 @@ async function listPollRuns(env, user) {
   return jsonResponse({ runs: res.results || [] });
 }
 
+async function listMediaCatalog(env) {
+  await ensureArticlePublisherColumns(env.DB);
+
+  const discoveredRes = await env.DB.prepare(
+    `SELECT publisher_name, publisher_domain, COUNT(*) AS article_count
+     FROM articles
+     GROUP BY publisher_name, publisher_domain
+     ORDER BY article_count DESC
+     LIMIT 400`,
+  ).all();
+
+  const discovered = (discoveredRes.results || []).map((row) => {
+    const publisherName = collapseSpace(String(row.publisher_name || ""));
+    const publisherDomain = collapseSpace(String(row.publisher_domain || ""));
+    const displayName = publisherName || publisherDomain || "(미분류)";
+    const tier = resolvePublisherTier(publisherName, publisherDomain);
+    return {
+      name: displayName,
+      publisher_name: publisherName,
+      publisher_domain: publisherDomain,
+      tier,
+      article_count: Number(row.article_count || 0),
+    };
+  });
+
+  const tiers = ALL_TIER_VALUES.map((tier) => {
+    const predefined = (MEDIA_TIER_NAMES[tier] || []).slice().sort((a, b) => a.localeCompare(b, "ko"));
+    const discoveredCount = discovered.filter((x) => x.tier === tier).length;
+    return {
+      tier,
+      label: `티어 ${tier}`,
+      predefined_sources: predefined,
+      predefined_count: predefined.length,
+      discovered_count: discoveredCount,
+    };
+  });
+
+  return jsonResponse({
+    tiers,
+    discovered,
+  });
+}
+
 async function runPoll(env, triggerType) {
   const db = env.DB;
+  await ensureArticlePublisherColumns(db);
   const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
 
@@ -650,8 +724,8 @@ async function runPoll(env, triggerType) {
         const articleId = await buildArticleId(article, group.query);
         const insertArticle = await db
           .prepare(
-            `INSERT INTO articles (id, source, query, title, url, normalized_url, published_at, summary)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `INSERT INTO articles (id, source, query, title, url, normalized_url, published_at, summary, publisher_name, publisher_domain)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO NOTHING`,
           )
           .bind(
@@ -663,6 +737,8 @@ async function runPoll(env, triggerType) {
             article.normalizedUrl,
             article.publishedAt,
             article.summary,
+            article.publisherName,
+            article.publisherDomain,
           )
           .run();
 
@@ -672,6 +748,9 @@ async function runPoll(env, triggerType) {
 
         for (const row of group.rows) {
           const keywordConfig = row.keyword_config || parseKeywordConfig(row);
+          if (!matchesTierFilter(article, keywordConfig.tierFilters)) {
+            continue;
+          }
           if (!matchesAnySearchTerm(article, keywordConfig.searchTerms)) {
             continue;
           }
@@ -852,6 +931,9 @@ function parseRssItems(xmlText) {
     const link = decodeEntities(stripCdata(getTagValue(raw, "link")));
     const description = stripHtml(decodeEntities(stripCdata(getTagValue(raw, "description"))));
     const pubDateRaw = stripCdata(getTagValue(raw, "pubDate"));
+    const sourceName = collapseSpace(decodeEntities(stripCdata(getTagValue(raw, "source"))));
+    const sourceUrl = decodeEntities(getTagAttribute(raw, "source", "url"));
+    const sourceDomain = normalizeDomain(extractHost(sourceUrl) || extractHost(link));
 
     items.push({
       title: collapseSpace(title),
@@ -859,6 +941,8 @@ function parseRssItems(xmlText) {
       normalizedUrl: normalizeUrl(link),
       summary: collapseSpace(description).slice(0, 500),
       publishedAt: toIsoDate(pubDateRaw),
+      publisherName: sourceName,
+      publisherDomain: sourceDomain,
     });
   }
 
@@ -867,6 +951,12 @@ function parseRssItems(xmlText) {
 
 function getTagValue(text, tag) {
   const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+  const match = text.match(regex);
+  return match ? match[1] : "";
+}
+
+function getTagAttribute(text, tag, attribute) {
+  const regex = new RegExp(`<${tag}\\b[^>]*\\b${attribute}="([^"]*)"[^>]*>`, "i");
   const match = text.match(regex);
   return match ? match[1] : "";
 }
@@ -932,6 +1022,76 @@ function normalizeUrl(input) {
   } catch {
     return raw;
   }
+}
+
+function extractHost(input) {
+  try {
+    const url = new URL(String(input || "").trim());
+    return url.hostname || "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizeDomain(value) {
+  const host = String(value || "").trim().toLowerCase();
+  if (!host) return "";
+  return host.startsWith("www.") ? host.slice(4) : host;
+}
+
+function buildMediaTierLookup() {
+  const nameMap = new Map();
+  const domainMap = new Map();
+
+  for (const tier of ALL_TIER_VALUES) {
+    for (const name of MEDIA_TIER_NAMES[tier] || []) {
+      const key = normalizePublisherKey(name);
+      if (key) nameMap.set(key, tier);
+    }
+    for (const domain of MEDIA_TIER_DOMAINS[tier] || []) {
+      const key = normalizeDomain(domain);
+      if (key) domainMap.set(key, tier);
+    }
+  }
+
+  return { nameMap, domainMap };
+}
+
+function normalizePublisherKey(value) {
+  return String(value || "")
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+function resolvePublisherTier(publisherName, publisherDomain) {
+  const nameKey = normalizePublisherKey(publisherName);
+  if (nameKey && MEDIA_TIER_LOOKUP.nameMap.has(nameKey)) {
+    return MEDIA_TIER_LOOKUP.nameMap.get(nameKey);
+  }
+
+  const domainKey = normalizeDomain(publisherDomain);
+  if (domainKey) {
+    if (MEDIA_TIER_LOOKUP.domainMap.has(domainKey)) {
+      return MEDIA_TIER_LOOKUP.domainMap.get(domainKey);
+    }
+    for (const [knownDomain, tier] of MEDIA_TIER_LOOKUP.domainMap.entries()) {
+      if (domainKey === knownDomain || domainKey.endsWith(`.${knownDomain}`)) {
+        return tier;
+      }
+    }
+  }
+
+  return 4;
+}
+
+function matchesTierFilter(article, tierFilters) {
+  const filters = normalizeTierFilters(tierFilters);
+  if (!filters.length) return true;
+  const domainFromUrl = normalizeDomain(extractHost(article?.normalizedUrl || article?.url));
+  const tier = resolvePublisherTier(article?.publisherName, article?.publisherDomain || domainFromUrl);
+  return filters.includes(tier);
 }
 
 function buildArticleHaystack(article) {
@@ -1145,6 +1305,7 @@ function parseKeywordConfig(row) {
       searchTerms,
       mustIncludeTerms: [],
       excludeTerms: normalizeTermArray(parsed),
+      tierFilters: [],
     };
   }
 
@@ -1156,12 +1317,14 @@ function parseKeywordConfig(row) {
       : normalizeSearchTermsInput(undefined, compiledQueryRaw);
     const mustIncludeTerms = normalizeTermArray(parsed.mustIncludeTerms);
     const excludeTerms = normalizeTermArray(parsed.excludeTerms);
+    const tierFilters = normalizeTierFilters(parsed.tierFilters || parsed.tiers);
     return {
       compiledQuery: buildExactOrQuery(resolvedSearchTerms) || compiledQueryRaw,
       topicLabel,
       searchTerms: resolvedSearchTerms,
       mustIncludeTerms,
       excludeTerms,
+      tierFilters,
     };
   }
 
@@ -1172,6 +1335,7 @@ function parseKeywordConfig(row) {
     searchTerms: fallbackSearchTerms,
     mustIncludeTerms: [],
     excludeTerms: [],
+    tierFilters: [],
   };
 }
 
@@ -1233,6 +1397,26 @@ function normalizeTermArray(input) {
     out.push(normalized);
   }
   return out;
+}
+
+function normalizeTierFilters(input) {
+  let parts = [];
+  if (Array.isArray(input)) {
+    parts = input;
+  } else if (input !== undefined && input !== null && input !== "") {
+    parts = String(input).split(/[\n,]+/);
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const raw of parts) {
+    const n = Number(String(raw).replace(/[^\d]/g, ""));
+    if (!Number.isInteger(n) || n < 1 || n > 4) continue;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out.sort((a, b) => a - b);
 }
 
 function buildExactOrQuery(searchTerms) {
@@ -1442,6 +1626,32 @@ function safePath(url) {
 
 async function assertCoreSchema(db) {
   await assertTableColumns(db, "users", ["id", "email", "name", "password_hash", "role", "active"]);
+}
+
+async function ensureArticlePublisherColumns(db) {
+  const table = await db.prepare("PRAGMA table_info(articles)").all();
+  const rows = table.results || [];
+  if (!rows.length) return;
+  const existing = new Set(rows.map((row) => String(row.name)));
+
+  const statements = [];
+  if (!existing.has("publisher_name")) {
+    statements.push("ALTER TABLE articles ADD COLUMN publisher_name TEXT");
+  }
+  if (!existing.has("publisher_domain")) {
+    statements.push("ALTER TABLE articles ADD COLUMN publisher_domain TEXT");
+  }
+
+  for (const statement of statements) {
+    try {
+      await db.prepare(statement).run();
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (!/duplicate column name/i.test(message)) {
+        throw error;
+      }
+    }
+  }
 }
 
 async function assertTableColumns(db, table, requiredColumns) {
