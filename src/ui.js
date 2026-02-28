@@ -191,6 +191,7 @@ function clientMain() {
         <td>${k.active ? "ON" : "OFF"}</td>
         <td>
           <div class="btns">
+            <button class="ghost" data-action="diagnose-keyword" data-id="${k.id}">진단</button>
             <button class="ghost" data-action="edit-keyword" data-id="${k.id}">수정</button>
             <button class="ghost" data-action="toggle-keyword" data-id="${k.id}" data-active="${k.active ? 1 : 0}">${k.active ? "중지" : "활성화"}</button>
             <button class="warn" data-action="delete-keyword" data-id="${k.id}">삭제</button>
@@ -604,6 +605,22 @@ function clientMain() {
           });
           await loadData();
           render();
+        } catch (err) {
+          setNotice(err.message, true);
+        }
+      });
+    });
+
+    app.querySelectorAll("button[data-action='diagnose-keyword']").forEach((el) => {
+      el.addEventListener("click", async () => {
+        try {
+          const res = await api("/api/keywords/" + el.dataset.id + "/diagnose");
+          const m = res.metrics || {};
+          setNotice(
+            `진단 결과 - Google:${m.fetched_google_rss || 0}, CustomRSS:${m.fetched_custom_rss || 0}, 중복제거:${m.merged_after_dedupe || 0}, 티어통과:${m.tier_passed || 0}, 검색통과:${m.search_passed || 0}, 최종:${m.final_passed || 0}`,
+            false,
+          );
+          console.log("keyword diagnose", res);
         } catch (err) {
           setNotice(err.message, true);
         }

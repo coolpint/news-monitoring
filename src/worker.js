@@ -113,6 +113,11 @@ async function handleRequest(request, env) {
     return deleteKeyword(env, session.user, keywordMatch[1]);
   }
 
+  const keywordDiagnoseMatch = path.match(/^\/api\/keywords\/([^/]+)\/diagnose$/);
+  if (keywordDiagnoseMatch && method === "GET") {
+    return diagnoseKeyword(env, session.user, keywordDiagnoseMatch[1]);
+  }
+
   if (path === "/api/channels" && method === "GET") {
     return listChannels(env, session.user);
   }
@@ -456,6 +461,88 @@ async function deleteKeyword(env, user, keywordId) {
 
   await env.DB.prepare("DELETE FROM keywords WHERE id = ?").bind(keywordId).run();
   return jsonResponse({ ok: true });
+}
+
+async function diagnoseKeyword(env, user, keywordId) {
+  const row = await env.DB.prepare(
+    "SELECT id, user_id, label, query, exclude_terms, source FROM keywords WHERE id = ? LIMIT 1",
+  )
+    .bind(keywordId)
+    .first();
+  if (!row) return jsonResponse({ error: "Keyword not found" }, 404);
+  if (user.role !== "admin" && row.user_id !== user.id) {
+    return jsonResponse({ error: "Forbidden" }, 403);
+  }
+
+  await ensureMediaSourcesTable(env.DB);
+  const tierLookup = await loadMediaTierLookup(env.DB);
+  const keywordConfig = parseKeywordConfig(row);
+
+  const [rssArticles, customRssArticles] = await Promise.all([
+    fetchArticlesForQuery(env, row.source, keywordConfig.compiledQuery),
+    fetchManagedRssArticles(env, env.DB),
+  ]);
+
+  const merged = dedupeArticlesByUrl([...rssArticles, ...customRssArticles]).slice(0, 200);
+  let tierPassed = 0;
+  let searchPassed = 0;
+  let mustPassed = 0;
+  let excludePassed = 0;
+
+  const samples = [];
+  for (const article of merged.slice(0, 30)) {
+    let reason = "pass";
+    if (!matchesTierFilter(article, keywordConfig.tierFilters, tierLookup)) {
+      reason = "filtered_by_tier";
+    } else {
+      tierPassed += 1;
+      if (!matchesAnySearchTerm(article, keywordConfig.searchTerms)) {
+        reason = "filtered_by_search";
+      } else {
+        searchPassed += 1;
+        if (!includesAllMustTerms(article, keywordConfig.mustIncludeTerms)) {
+          reason = "filtered_by_must_include";
+        } else {
+          mustPassed += 1;
+          if (isExcluded(article, keywordConfig.excludeTerms)) {
+            reason = "filtered_by_exclude";
+          } else {
+            excludePassed += 1;
+          }
+        }
+      }
+    }
+
+    samples.push({
+      title: article.title,
+      url: article.url,
+      publisher: article.publisherName || article.publisherDomain || "",
+      reason,
+    });
+  }
+
+  return jsonResponse({
+    keyword: {
+      id: row.id,
+      label: row.label,
+      topicLabel: keywordConfig.topicLabel,
+      query: keywordConfig.compiledQuery,
+      searchTerms: keywordConfig.searchTerms,
+      mustIncludeTerms: keywordConfig.mustIncludeTerms,
+      excludeTerms: keywordConfig.excludeTerms,
+      tierFilters: keywordConfig.tierFilters,
+    },
+    metrics: {
+      fetched_google_rss: rssArticles.length,
+      fetched_custom_rss: customRssArticles.length,
+      merged_after_dedupe: merged.length,
+      tier_passed: tierPassed,
+      search_passed: searchPassed,
+      must_include_passed: mustPassed,
+      final_passed: excludePassed,
+    },
+    samples,
+  });
 }
 
 async function listChannels(env, user) {
@@ -1129,17 +1216,23 @@ async function fetchArticlesForQuery(env, source, query) {
   const edition = (env.GOOGLE_NEWS_EDITION || "KR:ko").trim();
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=${encodeURIComponent(lang)}&gl=${encodeURIComponent(region)}&ceid=${encodeURIComponent(edition)}`;
 
-  const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
-  if (!res.ok) {
-    throw new Error(`google_rss fetch failed (${res.status})`);
+  try {
+    const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
+    if (!res.ok) {
+      console.warn("google_rss fetch failed", { status: res.status, query });
+      return [];
+    }
+
+    const xml = await res.text();
+    const parsed = parseRssItems(xml)
+      .filter((item) => item.title && item.url)
+      .slice(0, 20);
+
+    return parsed;
+  } catch (error) {
+    console.warn("google_rss fetch error", { query, error: String(error?.message || error) });
+    return [];
   }
-
-  const xml = await res.text();
-  const parsed = parseRssItems(xml)
-    .filter((item) => item.title && item.url)
-    .slice(0, 20);
-
-  return parsed;
 }
 
 async function fetchManagedRssArticles(env, db) {
@@ -1570,15 +1663,29 @@ function isExcluded(article, excludeTerms) {
 }
 
 function containsExactTerm(normalizedHaystack, term) {
-  const needle = normalizeMatchText(term);
-  if (!needle) return false;
-  return normalizedHaystack.includes(needle);
+  const strictNeedle = normalizeMatchText(term);
+  if (!strictNeedle) return false;
+  if (normalizedHaystack.includes(strictNeedle)) return true;
+
+  const looseNeedle = normalizeLooseMatchText(term);
+  if (!looseNeedle) return false;
+  const looseHaystack = normalizeLooseMatchText(normalizedHaystack);
+  return looseHaystack.includes(looseNeedle);
 }
 
 function normalizeMatchText(value) {
   return String(value || "")
     .normalize("NFC")
     .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeLooseMatchText(value) {
+  return String(value || "")
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
