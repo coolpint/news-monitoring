@@ -455,7 +455,9 @@ function clientMain() {
   }
 
   window.addEventListener("error", (event) => {
-    setNotice("클라이언트 오류: " + (event.error?.message || event.message || "unknown"), true);
+    const errObj = event && event.error ? event.error : null;
+    const errMsg = errObj && errObj.message ? errObj.message : (event && event.message ? event.message : "unknown");
+    setNotice("클라이언트 오류: " + errMsg, true);
   });
 
   window.addEventListener("unhandledrejection", (event) => {
