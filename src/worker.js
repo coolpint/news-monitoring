@@ -1175,16 +1175,19 @@ async function runPoll(env, triggerType) {
     const groupedByChannel = groupByChannel(pendingWithPath);
     for (const batch of groupedByChannel.values()) {
       const first = batch[0];
-      const sendResult = first.type === "slack"
-        ? await sendSlackWebhook(first.webhook_url, batch)
-        : await sendTeamsWebhook(first.webhook_url, batch);
+      const chunks = chunkRows(batch, 20);
+      for (const chunk of chunks) {
+        const sendResult = first.type === "slack"
+          ? await sendSlackWebhook(first.webhook_url, chunk)
+          : await sendTeamsWebhook(first.webhook_url, chunk);
 
-      if (sendResult.ok) {
-        sentNotifications += batch.length;
-        await markNotifications(db, batch.map((x) => x.notification_id), "sent", null);
-      } else {
-        failedNotifications += batch.length;
-        await markNotifications(db, batch.map((x) => x.notification_id), "failed", sendResult.error);
+        if (sendResult.ok) {
+          sentNotifications += chunk.length;
+          await markNotifications(db, chunk.map((x) => x.notification_id), "sent", null);
+        } else {
+          failedNotifications += chunk.length;
+          await markNotifications(db, chunk.map((x) => x.notification_id), "failed", sendResult.error);
+        }
       }
     }
 
@@ -1262,6 +1265,14 @@ function groupByChannel(rows) {
     map.get(row.channel_id).push(row);
   }
   return map;
+}
+
+function chunkRows(rows, size) {
+  const chunks = [];
+  for (let i = 0; i < rows.length; i += size) {
+    chunks.push(rows.slice(i, i + size));
+  }
+  return chunks;
 }
 
 async function fetchArticlesForQuery(env, source, query) {
