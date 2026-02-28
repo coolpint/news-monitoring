@@ -13,7 +13,7 @@ GOOGLE_NEWS_EDITION = "KR:ko"
 [[d1_databases]]
 binding = "DB"
 database_name = "news_monitoring"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "0d0bc32a-22a2-4aa4-a6d0-bdca86bde673"
 
 [observability]
 enabled = true
