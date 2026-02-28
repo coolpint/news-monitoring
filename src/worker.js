@@ -526,11 +526,8 @@ async function diagnoseKeyword(env, user, keywordId) {
   const channelsRes = await env.DB.prepare(
     `SELECT id, name, type, active
      FROM channels
-     WHERE user_id = ?
      ORDER BY created_at DESC`,
-  )
-    .bind(row.user_id)
-    .all();
+  ).all();
   const channels = (channelsRes.results || []).map((ch) => ({
     id: ch.id,
     name: ch.name,
@@ -614,19 +611,9 @@ async function diagnoseKeyword(env, user, keywordId) {
 }
 
 async function listChannels(env, user) {
-  const params = [];
-  let sql = "SELECT id, user_id, name, type, webhook_url, active, created_at, updated_at FROM channels";
-
-  if (user.role !== "admin") {
-    sql += " WHERE user_id = ?";
-    params.push(user.id);
-  }
-
-  sql += " ORDER BY created_at DESC";
-
-  const res = params.length
-    ? await env.DB.prepare(sql).bind(...params).all()
-    : await env.DB.prepare(sql).all();
+  const res = await env.DB.prepare(
+    "SELECT id, user_id, name, type, webhook_url, active, created_at, updated_at FROM channels ORDER BY created_at DESC",
+  ).all();
 
   const channels = (res.results || []).map((row) => ({
     ...row,
@@ -637,6 +624,10 @@ async function listChannels(env, user) {
 }
 
 async function createChannel(request, env, user) {
+  if (user.role !== "admin") {
+    return jsonResponse({ error: "Admin only" }, 403);
+  }
+
   const body = await readJson(request);
   const name = String(body.name || "").trim();
   const requestedType = String(body.type || "teams").trim().toLowerCase();
@@ -656,10 +647,7 @@ async function createChannel(request, env, user) {
     return jsonResponse({ error: "single_user_slack mode only allows slack" }, 403);
   }
 
-  const userId = user.role === "admin" && body.userId ? String(body.userId) : user.id;
-  if (user.role !== "admin" && userId !== user.id) {
-    return jsonResponse({ error: "Forbidden" }, 403);
-  }
+  const userId = user.id;
 
   const id = crypto.randomUUID();
   await env.DB.prepare(
@@ -673,13 +661,14 @@ async function createChannel(request, env, user) {
 }
 
 async function patchChannel(request, env, user, channelId) {
+  if (user.role !== "admin") {
+    return jsonResponse({ error: "Admin only" }, 403);
+  }
+
   const row = await env.DB.prepare("SELECT id, user_id FROM channels WHERE id = ? LIMIT 1")
     .bind(channelId)
     .first();
   if (!row) return jsonResponse({ error: "Channel not found" }, 404);
-  if (user.role !== "admin" && row.user_id !== user.id) {
-    return jsonResponse({ error: "Forbidden" }, 403);
-  }
 
   const body = await readJson(request);
   const fields = [];
@@ -715,13 +704,14 @@ async function patchChannel(request, env, user, channelId) {
 }
 
 async function deleteChannel(env, user, channelId) {
+  if (user.role !== "admin") {
+    return jsonResponse({ error: "Admin only" }, 403);
+  }
+
   const row = await env.DB.prepare("SELECT id, user_id FROM channels WHERE id = ? LIMIT 1")
     .bind(channelId)
     .first();
   if (!row) return jsonResponse({ error: "Channel not found" }, 404);
-  if (user.role !== "admin" && row.user_id !== user.id) {
-    return jsonResponse({ error: "Forbidden" }, 403);
-  }
 
   await env.DB.prepare("DELETE FROM channels WHERE id = ?").bind(channelId).run();
   return jsonResponse({ ok: true });
@@ -1074,7 +1064,7 @@ async function runPoll(env, triggerType) {
               u.name AS user_name, u.email AS user_email
        FROM keywords k
        JOIN users u ON u.id = k.user_id AND u.active = 1
-       JOIN channels c ON c.user_id = u.id AND c.active = 1
+       JOIN channels c ON c.active = 1
        WHERE k.active = 1
        ORDER BY k.query ASC`,
     ).all();

@@ -258,12 +258,12 @@ function clientMain() {
         <td>${esc(c.type)}</td>
         <td>${esc((c.webhook_url || "").slice(0, 48))}...</td>
         <td>${c.active ? "ON" : "OFF"}</td>
-        <td>
+        ${isAdmin ? `<td>
           <div class="btns">
             <button class="ghost" data-action="toggle-channel" data-id="${c.id}" data-active="${c.active ? 1 : 0}">${c.active ? "중지" : "활성화"}</button>
             <button class="warn" data-action="delete-channel" data-id="${c.id}">삭제</button>
           </div>
-        </td>
+        </td>` : ""}
       </tr>
     `).join("");
 
@@ -374,7 +374,7 @@ function clientMain() {
 
       <section class="card">
         <h2>알림 채널</h2>
-        <div class="row inline" style="margin-top:2px;">
+        ${isAdmin ? `<div class="row inline" style="margin-top:2px;">
           <div><label>채널 이름</label><input id="chName" placeholder="예: 홍보팀 Alerts" /></div>
           <div><label>타입</label>
             <select id="chType">
@@ -385,10 +385,10 @@ function clientMain() {
           </div>
           <div><label>Webhook URL</label><input id="chWebhook" placeholder="https://..." /></div>
         </div>
-        <div class="btns" style="margin-bottom:10px;"><button id="addChannelBtn">채널 추가</button></div>
+        <div class="btns" style="margin-bottom:10px;"><button id="addChannelBtn">채널 추가</button></div>` : `<div class="muted" style="margin-bottom:10px;">채널 관리는 관리자만 가능합니다. 알림은 전체 활성 채널로 공통 발송됩니다.</div>`}
         <table>
-          <thead><tr><th>이름</th><th>타입</th><th>Webhook</th><th>상태</th><th>관리</th></tr></thead>
-          <tbody>${channelRows || "<tr><td colspan='5' class='muted'>채널이 없습니다.</td></tr>"}</tbody>
+          <thead><tr><th>이름</th><th>타입</th><th>Webhook</th><th>상태</th>${isAdmin ? "<th>관리</th>" : ""}</tr></thead>
+          <tbody>${channelRows || `<tr><td colspan='${isAdmin ? "5" : "4"}' class='muted'>채널이 없습니다.</td></tr>`}</tbody>
         </table>
       </section>
 

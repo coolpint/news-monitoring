@@ -1,6 +1,6 @@
 # News Monitoring (Cloudflare Worker)
 
-뉴스 키워드 모니터링 알림을 `5분 주기`로 수집하고, 사용자별로 서로 다른 키워드를 설정해 `Teams/Slack` 웹훅으로 보내는 웹앱입니다.
+뉴스 키워드 모니터링 알림을 `5분 주기`로 수집하고, 키워드 소유자와 무관하게 `전체 활성 Teams/Slack 채널`로 공통 발송하는 웹앱입니다.
 
 - 기본 모드: `multi_user_teams` (회사 사용자별 키워드 + Teams 중심)
 - 대체 모드: `single_user_slack` (1인 운영 + Slack 중심)
@@ -13,7 +13,7 @@
 - 주제어 그룹 기능(`주제어>검색어` 라벨로 알림 식별)
 - 매체 티어 기반 필터(티어1~티어4)
 - 매체 URL 등록 + RSS/네이버 가능 여부 자동 검사
-- 사용자별 알림 채널(Teams/Slack webhook) 관리
+- 전역 알림 채널(Teams/Slack webhook) 관리
 - 5분 크론 수집(`*/5 * * * *`)
 - 중복 기사 방지(해시 키 기반)
 - 수동 실행 버튼 + 실행 이력 확인
@@ -115,7 +115,7 @@ MAX_CUSTOM_RSS_SOURCES_PER_RUN = "20"
 ### multi_user_teams
 
 - 관리자 계정으로 사내 사용자 추가
-- 사용자별 Teams 웹훅 등록
+- 전역 Teams/Slack 채널 등록(키워드 소유자와 무관하게 공통 발송)
 - 사용자별 키워드 운영
 
 ### single_user_slack
