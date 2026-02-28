@@ -6,6 +6,7 @@ compatibility_date = "2026-02-28"
 APP_MODE = "multi_user_teams" # multi_user_teams | single_user_slack
 MAX_USERS = "30"
 MAX_KEYWORDS_PER_USER = "40"
+MAX_CUSTOM_RSS_SOURCES_PER_RUN = "20"
 GOOGLE_NEWS_LANG = "ko"
 GOOGLE_NEWS_REGION = "KR"
 GOOGLE_NEWS_EDITION = "KR:ko"

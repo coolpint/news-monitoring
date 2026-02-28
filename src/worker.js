@@ -143,6 +143,21 @@ async function handleRequest(request, env) {
     return listMediaCatalog(env);
   }
 
+  if (path === "/api/media-sources" && method === "GET") {
+    return listMediaSources(env, session.user);
+  }
+  if (path === "/api/media-sources" && method === "POST") {
+    return createOrProbeMediaSource(request, env, session.user);
+  }
+
+  const mediaSourceMatch = path.match(/^\/api\/media-sources\/([^/]+)$/);
+  if (mediaSourceMatch && method === "PATCH") {
+    return patchMediaSource(request, env, session.user, mediaSourceMatch[1]);
+  }
+  if (mediaSourceMatch && method === "DELETE") {
+    return deleteMediaSource(env, session.user, mediaSourceMatch[1]);
+  }
+
   if (path === "/api/run-now" && method === "POST") {
     if (session.user.role !== "admin") {
       return jsonResponse({ error: "Admin only" }, 403);
@@ -641,6 +656,8 @@ async function listPollRuns(env, user) {
 
 async function listMediaCatalog(env) {
   await ensureArticlePublisherColumns(env.DB);
+  await ensureMediaSourcesTable(env.DB);
+  const tierLookup = await loadMediaTierLookup(env.DB);
 
   const discoveredRes = await env.DB.prepare(
     `SELECT publisher_name, publisher_domain, COUNT(*) AS article_count
@@ -654,7 +671,7 @@ async function listMediaCatalog(env) {
     const publisherName = collapseSpace(String(row.publisher_name || ""));
     const publisherDomain = collapseSpace(String(row.publisher_domain || ""));
     const displayName = publisherName || publisherDomain || "(미분류)";
-    const tier = resolvePublisherTier(publisherName, publisherDomain);
+    const tier = resolvePublisherTier(publisherName, publisherDomain, tierLookup);
     return {
       name: displayName,
       publisher_name: publisherName,
@@ -664,8 +681,25 @@ async function listMediaCatalog(env) {
     };
   });
 
+  const customRes = await env.DB.prepare(
+    `SELECT name, domain, tier
+     FROM media_sources
+     WHERE active = 1
+     ORDER BY created_at DESC`,
+  ).all();
+  const customByTier = new Map();
+  for (const tier of ALL_TIER_VALUES) {
+    customByTier.set(tier, []);
+  }
+  for (const row of customRes.results || []) {
+    const tier = Number(row.tier || 4);
+    if (!customByTier.has(tier)) continue;
+    const name = collapseSpace(String(row.name || row.domain || ""));
+    if (name) customByTier.get(tier).push(name);
+  }
+
   const tiers = ALL_TIER_VALUES.map((tier) => {
-    const predefined = (MEDIA_TIER_NAMES[tier] || []).slice().sort((a, b) => a.localeCompare(b, "ko"));
+    const predefined = toUniqueSorted([...(MEDIA_TIER_NAMES[tier] || []), ...(customByTier.get(tier) || [])], "ko");
     const discoveredCount = discovered.filter((x) => x.tier === tier).length;
     return {
       tier,
@@ -682,9 +716,186 @@ async function listMediaCatalog(env) {
   });
 }
 
+async function listMediaSources(env, user) {
+  await ensureMediaSourcesTable(env.DB);
+  const res = await env.DB.prepare(
+    `SELECT id, name, site_url, domain, tier, rss_url, naver_query, probe_status, probe_note, active, created_at, updated_at
+     FROM media_sources
+     ORDER BY updated_at DESC`,
+  ).all();
+
+  const sources = (res.results || []).map(mapMediaSourceRow);
+  return jsonResponse({ sources });
+}
+
+async function createOrProbeMediaSource(request, env, user) {
+  if (user.role !== "admin") {
+    return jsonResponse({ error: "Admin only" }, 403);
+  }
+
+  await ensureMediaSourcesTable(env.DB);
+  const body = await readJson(request);
+  const siteUrlInput = String(body.siteUrl || body.url || "").trim();
+  if (!siteUrlInput) {
+    return jsonResponse({ error: "siteUrl is required" }, 400);
+  }
+
+  const tier = normalizeTierFilters([body.tier])[0] || 4;
+  let probe;
+  try {
+    probe = await probeMediaSite(siteUrlInput);
+  } catch (error) {
+    return jsonResponse({ error: `Invalid site URL: ${String(error?.message || error)}` }, 400);
+  }
+  const name = collapseSpace(String(body.name || probe.name || probe.domain));
+
+  await env.DB.prepare(
+    `INSERT INTO media_sources (
+      id, name, site_url, domain, tier, rss_url, naver_query, probe_status, probe_note, active
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(domain) DO UPDATE SET
+      name = excluded.name,
+      site_url = excluded.site_url,
+      tier = excluded.tier,
+      rss_url = excluded.rss_url,
+      naver_query = excluded.naver_query,
+      probe_status = excluded.probe_status,
+      probe_note = excluded.probe_note,
+      active = 1,
+      updated_at = datetime('now')`,
+  )
+    .bind(
+      crypto.randomUUID(),
+      name,
+      probe.siteUrl,
+      probe.domain,
+      tier,
+      probe.rssUrl,
+      probe.naverQuery,
+      probe.status,
+      probe.note,
+    )
+    .run();
+
+  const saved = await env.DB.prepare(
+    `SELECT id, name, site_url, domain, tier, rss_url, naver_query, probe_status, probe_note, active, created_at, updated_at
+     FROM media_sources
+     WHERE domain = ?
+     LIMIT 1`,
+  )
+    .bind(probe.domain)
+    .first();
+
+  return jsonResponse({ ok: true, source: mapMediaSourceRow(saved), probe });
+}
+
+async function patchMediaSource(request, env, user, mediaSourceId) {
+  if (user.role !== "admin") {
+    return jsonResponse({ error: "Admin only" }, 403);
+  }
+
+  await ensureMediaSourcesTable(env.DB);
+  const row = await env.DB.prepare(
+    `SELECT id, name, site_url, domain, tier, rss_url, naver_query, probe_status, probe_note, active
+     FROM media_sources
+     WHERE id = ?
+     LIMIT 1`,
+  )
+    .bind(mediaSourceId)
+    .first();
+  if (!row) {
+    return jsonResponse({ error: "Media source not found" }, 404);
+  }
+
+  const body = await readJson(request);
+  const fields = [];
+  const params = [];
+
+  if (body.name !== undefined) {
+    fields.push("name = ?");
+    params.push(collapseSpace(String(body.name || "")));
+  }
+  if (body.tier !== undefined) {
+    const tier = normalizeTierFilters([body.tier])[0];
+    if (!tier) {
+      return jsonResponse({ error: "tier must be 1~4" }, 400);
+    }
+    fields.push("tier = ?");
+    params.push(tier);
+  }
+  if (body.active !== undefined) {
+    fields.push("active = ?");
+    params.push(Number(body.active) ? 1 : 0);
+  }
+
+  if (body.siteUrl !== undefined || Number(body.reprobe) === 1) {
+    const targetUrl = String(body.siteUrl || row.site_url || "").trim();
+    let probe;
+    try {
+      probe = await probeMediaSite(targetUrl);
+    } catch (error) {
+      return jsonResponse({ error: `Invalid site URL: ${String(error?.message || error)}` }, 400);
+    }
+    fields.push("site_url = ?");
+    params.push(probe.siteUrl);
+    fields.push("domain = ?");
+    params.push(probe.domain);
+    fields.push("rss_url = ?");
+    params.push(probe.rssUrl);
+    fields.push("naver_query = ?");
+    params.push(probe.naverQuery);
+    fields.push("probe_status = ?");
+    params.push(probe.status);
+    fields.push("probe_note = ?");
+    params.push(probe.note);
+    if (body.name === undefined) {
+      fields.push("name = ?");
+      params.push(collapseSpace(String(row.name || probe.name || probe.domain)));
+    }
+  }
+
+  if (!fields.length) {
+    return jsonResponse({ error: "No patch field" }, 400);
+  }
+
+  fields.push("updated_at = datetime('now')");
+  params.push(mediaSourceId);
+  await env.DB.prepare(`UPDATE media_sources SET ${fields.join(", ")} WHERE id = ?`).bind(...params).run();
+
+  const updated = await env.DB.prepare(
+    `SELECT id, name, site_url, domain, tier, rss_url, naver_query, probe_status, probe_note, active, created_at, updated_at
+     FROM media_sources
+     WHERE id = ?
+     LIMIT 1`,
+  )
+    .bind(mediaSourceId)
+    .first();
+
+  return jsonResponse({ ok: true, source: mapMediaSourceRow(updated) });
+}
+
+async function deleteMediaSource(env, user, mediaSourceId) {
+  if (user.role !== "admin") {
+    return jsonResponse({ error: "Admin only" }, 403);
+  }
+
+  await ensureMediaSourcesTable(env.DB);
+  const exists = await env.DB.prepare("SELECT id FROM media_sources WHERE id = ? LIMIT 1")
+    .bind(mediaSourceId)
+    .first();
+  if (!exists) {
+    return jsonResponse({ error: "Media source not found" }, 404);
+  }
+
+  await env.DB.prepare("DELETE FROM media_sources WHERE id = ?").bind(mediaSourceId).run();
+  return jsonResponse({ ok: true });
+}
+
 async function runPoll(env, triggerType) {
   const db = env.DB;
   await ensureArticlePublisherColumns(db);
+  await ensureMediaSourcesTable(db);
+  const tierLookup = await loadMediaTierLookup(db);
   const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
 
@@ -715,12 +926,37 @@ async function runPoll(env, triggerType) {
 
     const rows = keywordRows.results || [];
     const groupedByQuery = groupKeywordRows(rows);
+    const customRssArticles = await fetchManagedRssArticles(env, db);
+    fetchedCount += customRssArticles.length;
 
     for (const group of groupedByQuery.values()) {
       const articles = await fetchArticlesForQuery(env, group.source, group.query);
       fetchedCount += articles.length;
+      const mergedArticles = dedupeArticlesByUrl([...articles, ...customRssArticles]);
 
-      for (const article of articles) {
+      for (const article of mergedArticles) {
+        const matchedRows = [];
+        for (const row of group.rows) {
+          const keywordConfig = row.keyword_config || parseKeywordConfig(row);
+          if (!matchesTierFilter(article, keywordConfig.tierFilters, tierLookup)) {
+            continue;
+          }
+          if (!matchesAnySearchTerm(article, keywordConfig.searchTerms)) {
+            continue;
+          }
+          if (!includesAllMustTerms(article, keywordConfig.mustIncludeTerms)) {
+            continue;
+          }
+          if (isExcluded(article, keywordConfig.excludeTerms)) {
+            continue;
+          }
+          matchedRows.push(row);
+        }
+
+        if (!matchedRows.length) {
+          continue;
+        }
+
         const articleId = await buildArticleId(article, group.query);
         const insertArticle = await db
           .prepare(
@@ -746,21 +982,7 @@ async function runPoll(env, triggerType) {
           newArticleCount += 1;
         }
 
-        for (const row of group.rows) {
-          const keywordConfig = row.keyword_config || parseKeywordConfig(row);
-          if (!matchesTierFilter(article, keywordConfig.tierFilters)) {
-            continue;
-          }
-          if (!matchesAnySearchTerm(article, keywordConfig.searchTerms)) {
-            continue;
-          }
-          if (!includesAllMustTerms(article, keywordConfig.mustIncludeTerms)) {
-            continue;
-          }
-          if (isExcluded(article, keywordConfig.excludeTerms)) {
-            continue;
-          }
-
+        for (const row of matchedRows) {
           const insertNotif = await db
             .prepare(
               `INSERT INTO notifications (id, article_id, user_id, keyword_id, channel_id, status)
@@ -920,6 +1142,56 @@ async function fetchArticlesForQuery(env, source, query) {
   return parsed;
 }
 
+async function fetchManagedRssArticles(env, db) {
+  const maxSources = getMaxCustomRssSourcesPerRun(env);
+  if (maxSources <= 0) return [];
+
+  const sourcesRes = await db.prepare(
+    `SELECT id, name, domain, rss_url
+     FROM media_sources
+     WHERE active = 1 AND rss_url IS NOT NULL AND trim(rss_url) <> ''
+     ORDER BY updated_at DESC
+     LIMIT ?`,
+  )
+    .bind(maxSources)
+    .all();
+
+  const sources = sourcesRes.results || [];
+  if (!sources.length) return [];
+
+  const fetches = sources.map(async (source) => {
+    try {
+      const res = await fetch(String(source.rss_url), { cf: { cacheTtl: 0, cacheEverything: false } });
+      if (!res.ok) return [];
+      const xml = await res.text();
+      const parsed = parseRssItems(xml).slice(0, 20);
+      return parsed.map((item) => ({
+        ...item,
+        publisherName: item.publisherName || collapseSpace(String(source.name || "")),
+        publisherDomain: item.publisherDomain || normalizeDomain(String(source.domain || "")),
+      }));
+    } catch {
+      return [];
+    }
+  });
+
+  const settled = await Promise.all(fetches);
+  const merged = settled.flat();
+  return dedupeArticlesByUrl(merged).slice(0, maxSources * 20);
+}
+
+function dedupeArticlesByUrl(articles) {
+  const map = new Map();
+  for (const article of articles || []) {
+    const key = String(article?.normalizedUrl || article?.url || "").trim();
+    if (!key) continue;
+    if (!map.has(key)) {
+      map.set(key, article);
+    }
+  }
+  return [...map.values()];
+}
+
 function parseRssItems(xmlText) {
   const items = [];
   const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
@@ -1039,6 +1311,17 @@ function normalizeDomain(value) {
   return host.startsWith("www.") ? host.slice(4) : host;
 }
 
+function normalizeSiteUrl(input) {
+  let raw = String(input || "").trim();
+  if (!raw) return "";
+  if (!/^https?:\/\//i.test(raw)) {
+    raw = `https://${raw}`;
+  }
+  const url = new URL(raw);
+  url.hash = "";
+  return url.toString();
+}
+
 function buildMediaTierLookup() {
   const nameMap = new Map();
   const domainMap = new Map();
@@ -1065,18 +1348,18 @@ function normalizePublisherKey(value) {
     .trim();
 }
 
-function resolvePublisherTier(publisherName, publisherDomain) {
+function resolvePublisherTier(publisherName, publisherDomain, tierLookup = MEDIA_TIER_LOOKUP) {
   const nameKey = normalizePublisherKey(publisherName);
-  if (nameKey && MEDIA_TIER_LOOKUP.nameMap.has(nameKey)) {
-    return MEDIA_TIER_LOOKUP.nameMap.get(nameKey);
+  if (nameKey && tierLookup.nameMap.has(nameKey)) {
+    return tierLookup.nameMap.get(nameKey);
   }
 
   const domainKey = normalizeDomain(publisherDomain);
   if (domainKey) {
-    if (MEDIA_TIER_LOOKUP.domainMap.has(domainKey)) {
-      return MEDIA_TIER_LOOKUP.domainMap.get(domainKey);
+    if (tierLookup.domainMap.has(domainKey)) {
+      return tierLookup.domainMap.get(domainKey);
     }
-    for (const [knownDomain, tier] of MEDIA_TIER_LOOKUP.domainMap.entries()) {
+    for (const [knownDomain, tier] of tierLookup.domainMap.entries()) {
       if (domainKey === knownDomain || domainKey.endsWith(`.${knownDomain}`)) {
         return tier;
       }
@@ -1086,12 +1369,179 @@ function resolvePublisherTier(publisherName, publisherDomain) {
   return 4;
 }
 
-function matchesTierFilter(article, tierFilters) {
+function matchesTierFilter(article, tierFilters, tierLookup = MEDIA_TIER_LOOKUP) {
   const filters = normalizeTierFilters(tierFilters);
   if (!filters.length) return true;
   const domainFromUrl = normalizeDomain(extractHost(article?.normalizedUrl || article?.url));
-  const tier = resolvePublisherTier(article?.publisherName, article?.publisherDomain || domainFromUrl);
+  const tier = resolvePublisherTier(article?.publisherName, article?.publisherDomain || domainFromUrl, tierLookup);
   return filters.includes(tier);
+}
+
+function toUniqueSorted(values, locale = "ko") {
+  const out = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    const normalized = collapseSpace(String(value || ""));
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out.sort((a, b) => a.localeCompare(b, locale));
+}
+
+async function loadMediaTierLookup(db) {
+  await ensureMediaSourcesTable(db);
+  const lookup = {
+    nameMap: new Map(MEDIA_TIER_LOOKUP.nameMap),
+    domainMap: new Map(MEDIA_TIER_LOOKUP.domainMap),
+  };
+
+  const res = await db.prepare(
+    `SELECT name, domain, tier
+     FROM media_sources
+     WHERE active = 1`,
+  ).all();
+  for (const row of res.results || []) {
+    const tier = Number(row.tier || 4);
+    if (!ALL_TIER_VALUES.includes(tier)) continue;
+    const nameKey = normalizePublisherKey(row.name);
+    const domainKey = normalizeDomain(row.domain);
+    if (nameKey) lookup.nameMap.set(nameKey, tier);
+    if (domainKey) lookup.domainMap.set(domainKey, tier);
+  }
+  return lookup;
+}
+
+function mapMediaSourceRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    tier: Number(row.tier || 4),
+    active: Number(row.active) === 1,
+    rss_supported: Boolean(row.rss_url),
+    naver_supported: Boolean(row.naver_query),
+  };
+}
+
+async function probeMediaSite(inputUrl) {
+  const siteUrl = normalizeSiteUrl(inputUrl);
+  if (!siteUrl) {
+    throw new Error("Invalid site URL");
+  }
+  const site = new URL(siteUrl);
+  const domain = normalizeDomain(site.hostname);
+  if (!domain) {
+    throw new Error("Invalid domain");
+  }
+
+  let homepageHtml = "";
+  let inferredName = domain;
+
+  try {
+    const res = await fetch(siteUrl, { cf: { cacheTtl: 0, cacheEverything: false } });
+    if (res.ok) {
+      homepageHtml = await res.text();
+      const titleMatch = homepageHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      if (titleMatch?.[1]) {
+        inferredName = collapseSpace(stripHtml(decodeEntities(titleMatch[1])));
+      }
+    }
+  } catch {
+    // Ignore homepage fetch failures.
+  }
+
+  const rssCandidates = buildRssCandidates(siteUrl, homepageHtml);
+  let rssUrl = "";
+  for (const candidate of rssCandidates) {
+    try {
+      const res = await fetch(candidate, { cf: { cacheTtl: 0, cacheEverything: false } });
+      if (!res.ok) continue;
+      const contentType = (res.headers.get("content-type") || "").toLowerCase();
+      const text = await res.text();
+      const looksLikeRss = contentType.includes("xml")
+        || /<rss[\s>]/i.test(text)
+        || /<feed[\s>]/i.test(text);
+      if (looksLikeRss) {
+        rssUrl = candidate;
+        break;
+      }
+    } catch {
+      // Ignore per-candidate failures.
+    }
+  }
+
+  const naverQuery = `site:${domain}`;
+  let naverSupported = false;
+  try {
+    const naverUrl = `https://search.naver.com/search.naver?where=news&query=${encodeURIComponent(naverQuery)}`;
+    const naverRes = await fetch(naverUrl, { cf: { cacheTtl: 0, cacheEverything: false } });
+    naverSupported = naverRes.ok;
+  } catch {
+    naverSupported = false;
+  }
+
+  const status = rssUrl && naverSupported
+    ? "ok_both"
+    : rssUrl
+      ? "ok_rss"
+      : naverSupported
+        ? "ok_naver"
+        : "unavailable";
+  const note = status === "ok_both"
+    ? "자체 RSS + 네이버 뉴스검색 가능"
+    : status === "ok_rss"
+      ? "자체 RSS 확인, 네이버 뉴스검색 불확실"
+      : status === "ok_naver"
+        ? "네이버 뉴스검색 가능, 자체 RSS 미확인"
+        : "자체 RSS/네이버 뉴스검색 확인 실패";
+
+  return {
+    siteUrl,
+    domain,
+    name: inferredName || domain,
+    rssUrl: rssUrl || null,
+    naverQuery: naverSupported ? naverQuery : null,
+    status,
+    note,
+  };
+}
+
+function buildRssCandidates(siteUrl, homepageHtml) {
+  const site = new URL(siteUrl);
+  const set = new Set([
+    new URL("/rss", site).toString(),
+    new URL("/rss.xml", site).toString(),
+    new URL("/feed", site).toString(),
+    new URL("/feed.xml", site).toString(),
+    new URL("/atom.xml", site).toString(),
+    new URL("/news/rss", site).toString(),
+    new URL("/news/rss.xml", site).toString(),
+  ]);
+
+  const linkRegex = /<link\b[^>]*>/gi;
+  let match;
+  while ((match = linkRegex.exec(homepageHtml || "")) !== null) {
+    const tag = match[0];
+    const type = collapseSpace(String(extractHtmlAttr(tag, "type") || "")).toLowerCase();
+    if (!type.includes("rss") && !type.includes("atom")) continue;
+    const href = extractHtmlAttr(tag, "href");
+    if (!href) continue;
+    try {
+      set.add(new URL(href, site).toString());
+    } catch {
+      // ignore bad url
+    }
+  }
+
+  return [...set];
+}
+
+function extractHtmlAttr(tag, attr) {
+  const regex = new RegExp(`${attr}\\s*=\\s*["']([^"']+)["']`, "i");
+  const match = String(tag || "").match(regex);
+  return match ? match[1] : "";
 }
 
 function buildArticleHaystack(article) {
@@ -1291,6 +1741,14 @@ function getMaxUsers(env) {
 function getMaxKeywordsPerUser(env) {
   const n = Number(env.MAX_KEYWORDS_PER_USER);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_KEYWORDS_PER_USER;
+}
+
+function getMaxCustomRssSourcesPerRun(env) {
+  const n = Number(env.MAX_CUSTOM_RSS_SOURCES_PER_RUN);
+  if (Number.isFinite(n) && n >= 0) {
+    return Math.min(Math.floor(n), 200);
+  }
+  return 20;
 }
 
 function parseKeywordConfig(row) {
@@ -1652,6 +2110,27 @@ async function ensureArticlePublisherColumns(db) {
       }
     }
   }
+}
+
+async function ensureMediaSourcesTable(db) {
+  await db.prepare(
+    `CREATE TABLE IF NOT EXISTS media_sources (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      site_url TEXT NOT NULL,
+      domain TEXT NOT NULL UNIQUE,
+      tier INTEGER NOT NULL DEFAULT 4,
+      rss_url TEXT,
+      naver_query TEXT,
+      probe_status TEXT NOT NULL DEFAULT 'pending',
+      probe_note TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+  ).run();
+
+  await db.prepare("CREATE INDEX IF NOT EXISTS idx_media_sources_tier_active ON media_sources(tier, active)").run();
 }
 
 async function assertTableColumns(db, table, requiredColumns) {

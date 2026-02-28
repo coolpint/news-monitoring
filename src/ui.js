@@ -5,6 +5,7 @@ function clientMain() {
     keywords: [],
     channels: [],
     mediaCatalog: { tiers: [], discovered: [] },
+    mediaSources: [],
     mediaSearch: "",
     users: [],
     runs: [],
@@ -122,14 +123,16 @@ function clientMain() {
   }
 
   async function loadData() {
-    const [keywords, channels, mediaCatalog] = await Promise.all([
+    const [keywords, channels, mediaCatalog, mediaSources] = await Promise.all([
       api("/api/keywords"),
       api("/api/channels"),
       api("/api/media-catalog"),
+      api("/api/media-sources"),
     ]);
     state.keywords = keywords.keywords || [];
     state.channels = channels.channels || [];
     state.mediaCatalog = mediaCatalog || { tiers: [], discovered: [] };
+    state.mediaSources = mediaSources.sources || [];
 
     if (state.me.role === "admin") {
       const [runs, users] = await Promise.all([api("/api/poll-runs"), api("/api/users")]);
@@ -170,9 +173,17 @@ function clientMain() {
 
   function renderDashboard() {
     const isAdmin = state.me.role === "admin";
-    const keywordRows = state.keywords.map((k) => `
+    const sortedKeywords = [...state.keywords].sort((a, b) => {
+      const topicA = String(a.topic_label || "").toLowerCase();
+      const topicB = String(b.topic_label || "").toLowerCase();
+      if (topicA !== topicB) return topicA.localeCompare(topicB, "ko");
+      return String(a.label || "").localeCompare(String(b.label || ""), "ko");
+    });
+
+    const keywordRows = sortedKeywords.map((k) => `
       <tr>
-        <td>${esc(k.keyword_path || ((k.topic_label ? `${k.topic_label}>` : "") + (k.label || "")))}</td>
+        <td>${esc(k.topic_label || "-")}</td>
+        <td>${esc(k.label || "-")}</td>
         <td>${(k.search_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${(k.must_include_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${(k.exclude_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
@@ -180,7 +191,7 @@ function clientMain() {
         <td>${k.active ? "ON" : "OFF"}</td>
         <td>
           <div class="btns">
-            <button class="ghost" data-action="set-topic" data-id="${k.id}" data-topic="${esc(k.topic_label || "")}">주제어 변경</button>
+            <button class="ghost" data-action="edit-keyword" data-id="${k.id}">수정</button>
             <button class="ghost" data-action="toggle-keyword" data-id="${k.id}" data-active="${k.active ? 1 : 0}">${k.active ? "중지" : "활성화"}</button>
             <button class="warn" data-action="delete-keyword" data-id="${k.id}">삭제</button>
           </div>
@@ -218,6 +229,27 @@ function clientMain() {
           <td>${item.article_count}</td>
         </tr>
       `).join("");
+
+    const mediaSourceRows = (state.mediaSources || []).map((item) => `
+      <tr>
+        <td>${esc(item.name || "-")}</td>
+        <td>${esc(item.domain || "-")}</td>
+        <td>T${Number(item.tier || 4)}</td>
+        <td>${item.rss_supported ? "RSS" : "-"}</td>
+        <td>${item.naver_supported ? "Naver" : "-"}</td>
+        <td>${esc(item.probe_status || "-")}</td>
+        <td>${esc(item.probe_note || "-")}</td>
+        <td>${item.active ? "ON" : "OFF"}</td>
+        ${isAdmin ? `<td>
+          <div class="btns">
+            <button class="ghost" data-action="media-reprobe" data-id="${item.id}">재검사</button>
+            <button class="ghost" data-action="media-set-tier" data-id="${item.id}" data-tier="${Number(item.tier || 4)}">티어변경</button>
+            <button class="ghost" data-action="media-toggle" data-id="${item.id}" data-active="${item.active ? 1 : 0}">${item.active ? "중지" : "활성화"}</button>
+            <button class="warn" data-action="media-delete" data-id="${item.id}">삭제</button>
+          </div>
+        </td>` : ""}
+      </tr>
+    `).join("");
 
     const channelRows = state.channels.map((c) => `
       <tr>
@@ -283,61 +315,79 @@ function clientMain() {
         </div>
       </section>
 
-      <div class="split">
-        <section class="card">
-          <h2>키워드</h2>
-          <div class="muted" style="margin-bottom:10px;">검색어는 정확 일치로 처리되며 여러 개 입력 시 OR 조건으로 동작합니다.</div>
-          <div class="muted" style="margin-bottom:10px;">주제어를 입력하면 알림 라벨이 주제어&gt;검색어 형태로 표시됩니다.</div>
-          <table>
-            <thead><tr><th>주제어&gt;검색어</th><th>검색어(OR)</th><th>꼭 포함</th><th>제외</th><th>티어</th><th>상태</th><th>관리</th></tr></thead>
-            <tbody>${keywordRows || "<tr><td colspan='7' class='muted'>아직 키워드가 없습니다.</td></tr>"}</tbody>
-          </table>
-          <div class="row inline" style="margin-top:10px;">
-            <div><label>주제어 그룹</label><input id="kwTopic" placeholder="예: 지바이크" /></div>
-            <div><label>검색어 이름</label><input id="kwLabel" placeholder="예: 경쟁사" /></div>
-            <div><label>검색어(쉼표/줄바꿈)</label><input id="kwSearchTerms" placeholder="예: 회사명, 브랜드명" /></div>
-            <div><label>꼭 포함(쉼표/줄바꿈)</label><input id="kwMustInclude" placeholder="예: 투자유치, 신제품" /></div>
-            <div><label>제외어(쉼표/줄바꿈)</label><input id="kwExclude" placeholder="예: 채용, 공고" /></div>
-          </div>
-          <div class="tier-picks">
-            <label><input id="kwTier1" type="checkbox" checked /> 티어1</label>
-            <label><input id="kwTier2" type="checkbox" checked /> 티어2</label>
-            <label><input id="kwTier3" type="checkbox" checked /> 티어3</label>
-            <label><input id="kwTier4" type="checkbox" checked /> 티어4</label>
-          </div>
-          <div class="btns"><button id="addKeywordBtn">키워드 추가</button></div>
-        </section>
-
-        <section class="card">
-          <h2>알림 채널</h2>
-          <table>
-            <thead><tr><th>이름</th><th>타입</th><th>Webhook</th><th>상태</th><th>관리</th></tr></thead>
-            <tbody>${channelRows || "<tr><td colspan='5' class='muted'>채널이 없습니다.</td></tr>"}</tbody>
-          </table>
-          <div class="row inline" style="margin-top:10px;">
-            <div><label>채널 이름</label><input id="chName" placeholder="예: 홍보팀 Alerts" /></div>
-            <div><label>타입</label>
-              <select id="chType">
-                ${state.bootstrap.appMode === "single_user_slack"
-                  ? "<option value='slack'>slack</option>"
-                  : "<option value='teams'>teams</option><option value='slack'>slack</option>"}
-              </select>
-            </div>
-            <div><label>Webhook URL</label><input id="chWebhook" placeholder="https://..." /></div>
-          </div>
-          <div class="btns"><button id="addChannelBtn">채널 추가</button></div>
-        </section>
-      </div>
+      <section class="card">
+        <h2>키워드 관리</h2>
+        <div class="muted" style="margin-bottom:10px;">검색어는 정확 일치로 처리되며 여러 개 입력 시 OR 조건으로 동작합니다.</div>
+        <table>
+          <thead><tr><th>주제어</th><th>검색어</th><th>검색어(OR)</th><th>꼭 포함</th><th>제외</th><th>티어</th><th>상태</th><th>관리</th></tr></thead>
+          <tbody>${keywordRows || "<tr><td colspan='8' class='muted'>아직 키워드가 없습니다.</td></tr>"}</tbody>
+        </table>
+        <div class="row inline" style="margin-top:10px;">
+          <div><label>주제어 그룹</label><input id="kwTopic" placeholder="예: 지바이크" /></div>
+          <div><label>검색어 이름</label><input id="kwLabel" placeholder="예: 경쟁사" /></div>
+          <div><label>검색어(쉼표/줄바꿈)</label><input id="kwSearchTerms" placeholder="예: 회사명, 브랜드명" /></div>
+          <div><label>꼭 포함(쉼표/줄바꿈)</label><input id="kwMustInclude" placeholder="예: 투자유치, 신제품" /></div>
+          <div><label>제외어(쉼표/줄바꿈)</label><input id="kwExclude" placeholder="예: 채용, 공고" /></div>
+        </div>
+        <div class="tier-picks">
+          <label><input id="kwTier1" type="checkbox" checked /> 티어1</label>
+          <label><input id="kwTier2" type="checkbox" checked /> 티어2</label>
+          <label><input id="kwTier3" type="checkbox" checked /> 티어3</label>
+          <label><input id="kwTier4" type="checkbox" checked /> 티어4</label>
+        </div>
+        <div class="btns"><button id="addKeywordBtn">키워드 추가</button></div>
+      </section>
 
       <section class="card">
         <div class="media-head">
           <h2 style="margin:0;">매체 티어</h2>
           <input id="mediaSearch" placeholder="매체명/도메인 검색" value="${esc(state.mediaSearch)}" />
         </div>
+        ${isAdmin ? `<div class="row inline">
+          <div><label>매체 URL</label><input id="mediaSiteUrl" placeholder="https://example.com" /></div>
+          <div><label>표시 이름(선택)</label><input id="mediaName" placeholder="예: OO경제" /></div>
+          <div><label>티어</label>
+            <select id="mediaTier">
+              <option value="1">티어1</option>
+              <option value="2">티어2</option>
+              <option value="3">티어3</option>
+              <option value="4" selected>티어4</option>
+            </select>
+          </div>
+        </div>
+        <div class="btns" style="margin-bottom:12px;">
+          <button id="addMediaSourceBtn">매체 추가 + RSS/네이버 검사</button>
+        </div>` : `<div class="muted" style="margin-bottom:10px;">매체 추가/수정은 관리자만 가능합니다.</div>`}
+
+        <table>
+          <thead><tr><th>이름</th><th>도메인</th><th>티어</th><th>RSS</th><th>Naver</th><th>상태</th><th>결과</th><th>활성</th>${isAdmin ? "<th>관리</th>" : ""}</tr></thead>
+          <tbody>${mediaSourceRows || `<tr><td colspan='${isAdmin ? "9" : "8"}' class='muted'>등록된 매체가 없습니다.</td></tr>`}</tbody>
+        </table>
+
         <div class="tier-grid">${tierCards || "<div class='muted'>티어 정보 없음</div>"}</div>
         <table style="margin-top:12px;">
           <thead><tr><th>매체</th><th>티어</th><th>도메인</th><th>수집건수</th></tr></thead>
           <tbody>${discoveredRows || "<tr><td colspan='4' class='muted'>수집된 매체 데이터가 아직 없습니다.</td></tr>"}</tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>알림 채널</h2>
+        <div class="row inline" style="margin-top:2px;">
+          <div><label>채널 이름</label><input id="chName" placeholder="예: 홍보팀 Alerts" /></div>
+          <div><label>타입</label>
+            <select id="chType">
+              ${state.bootstrap.appMode === "single_user_slack"
+                ? "<option value='slack'>slack</option>"
+                : "<option value='teams'>teams</option><option value='slack'>slack</option>"}
+            </select>
+          </div>
+          <div><label>Webhook URL</label><input id="chWebhook" placeholder="https://..." /></div>
+        </div>
+        <div class="btns" style="margin-bottom:10px;"><button id="addChannelBtn">채널 추가</button></div>
+        <table>
+          <thead><tr><th>이름</th><th>타입</th><th>Webhook</th><th>상태</th><th>관리</th></tr></thead>
+          <tbody>${channelRows || "<tr><td colspan='5' class='muted'>채널이 없습니다.</td></tr>"}</tbody>
         </table>
       </section>
 
@@ -469,6 +519,27 @@ function clientMain() {
       });
     }
 
+    const addMediaSourceBtn = document.getElementById("addMediaSourceBtn");
+    if (addMediaSourceBtn) {
+      addMediaSourceBtn.addEventListener("click", async () => {
+        try {
+          const res = await api("/api/media-sources", {
+            method: "POST",
+            body: {
+              siteUrl: document.getElementById("mediaSiteUrl").value,
+              name: document.getElementById("mediaName").value,
+              tier: Number(document.getElementById("mediaTier").value || 4),
+            },
+          });
+          setNotice(`매체 등록/검사 완료: ${res.source.name} (${res.source.probe_status})`);
+          await loadData();
+          render();
+        } catch (err) {
+          setNotice(err.message, true);
+        }
+      });
+    }
+
     const addChannelBtn = document.getElementById("addChannelBtn");
     if (addChannelBtn) {
       addChannelBtn.addEventListener("click", async () => {
@@ -539,17 +610,106 @@ function clientMain() {
       });
     });
 
-    app.querySelectorAll("button[data-action='set-topic']").forEach((el) => {
+    app.querySelectorAll("button[data-action='edit-keyword']").forEach((el) => {
       el.addEventListener("click", async () => {
-        const nextTopic = window.prompt("주제어 그룹을 입력하세요. 비워두면 해제됩니다.", el.dataset.topic || "");
+        const current = state.keywords.find((x) => x.id === el.dataset.id);
+        if (!current) return;
+
+        const nextTopic = window.prompt("주제어 그룹", current.topic_label || "");
         if (nextTopic === null) return;
+        const nextLabel = window.prompt("검색어 이름", current.label || "");
+        if (nextLabel === null) return;
+        const nextSearch = window.prompt("검색어(쉼표 구분, OR)", (current.search_terms || []).join(", "));
+        if (nextSearch === null) return;
+        const nextMust = window.prompt("꼭 포함(쉼표 구분)", (current.must_include_terms || []).join(", "));
+        if (nextMust === null) return;
+        const nextExclude = window.prompt("제외어(쉼표 구분)", (current.exclude_terms || []).join(", "));
+        if (nextExclude === null) return;
+        const defaultTierValue = normalizeTierFilters(current.tier_filters).length
+          ? normalizeTierFilters(current.tier_filters).join(",")
+          : "1,2,3,4";
+        const nextTier = window.prompt("티어(예: 1,2,3 / 전체는 1,2,3,4)", defaultTierValue);
+        if (nextTier === null) return;
+
+        const parsedTier = normalizeTierFilters(String(nextTier).split(/[\s,]+/));
+        const tierFilters = parsedTier.length === 4 ? [] : parsedTier;
 
         try {
           await api("/api/keywords/" + el.dataset.id, {
             method: "PATCH",
-            body: { topicLabel: nextTopic },
+            body: {
+              topicLabel: nextTopic,
+              label: nextLabel,
+              searchTerms: parseTermInput(nextSearch),
+              mustIncludeTerms: parseTermInput(nextMust),
+              excludeTerms: parseTermInput(nextExclude),
+              tierFilters,
+            },
           });
-          setNotice("주제어 그룹을 변경했습니다.");
+          setNotice("키워드를 수정했습니다.");
+          await loadData();
+          render();
+        } catch (err) {
+          setNotice(err.message, true);
+        }
+      });
+    });
+
+    app.querySelectorAll("button[data-action='media-reprobe']").forEach((el) => {
+      el.addEventListener("click", async () => {
+        try {
+          await api("/api/media-sources/" + el.dataset.id, {
+            method: "PATCH",
+            body: { reprobe: 1 },
+          });
+          setNotice("매체 재검사를 완료했습니다.");
+          await loadData();
+          render();
+        } catch (err) {
+          setNotice(err.message, true);
+        }
+      });
+    });
+
+    app.querySelectorAll("button[data-action='media-set-tier']").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const nextTier = window.prompt("티어를 입력하세요 (1~4)", el.dataset.tier || "4");
+        if (nextTier === null) return;
+        try {
+          await api("/api/media-sources/" + el.dataset.id, {
+            method: "PATCH",
+            body: { tier: Number(nextTier) },
+          });
+          setNotice("매체 티어를 변경했습니다.");
+          await loadData();
+          render();
+        } catch (err) {
+          setNotice(err.message, true);
+        }
+      });
+    });
+
+    app.querySelectorAll("button[data-action='media-toggle']").forEach((el) => {
+      el.addEventListener("click", async () => {
+        try {
+          await api("/api/media-sources/" + el.dataset.id, {
+            method: "PATCH",
+            body: { active: Number(el.dataset.active) === 1 ? 0 : 1 },
+          });
+          setNotice("매체 활성 상태를 변경했습니다.");
+          await loadData();
+          render();
+        } catch (err) {
+          setNotice(err.message, true);
+        }
+      });
+    });
+
+    app.querySelectorAll("button[data-action='media-delete']").forEach((el) => {
+      el.addEventListener("click", async () => {
+        try {
+          await api("/api/media-sources/" + el.dataset.id, { method: "DELETE" });
+          setNotice("매체를 삭제했습니다.");
           await loadData();
           render();
         } catch (err) {
@@ -632,7 +792,7 @@ export function renderAppShell() {
           var(--bg);
       }
       .wrap {
-        max-width: 1120px;
+        max-width: 1520px;
         margin: 0 auto;
         padding: 24px 16px 48px;
       }

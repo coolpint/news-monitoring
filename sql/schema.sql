@@ -57,6 +57,23 @@ CREATE TABLE IF NOT EXISTS articles (
 
 CREATE INDEX IF NOT EXISTS idx_articles_query_seen ON articles(query, first_seen_at DESC);
 
+CREATE TABLE IF NOT EXISTS media_sources (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  site_url TEXT NOT NULL,
+  domain TEXT NOT NULL UNIQUE,
+  tier INTEGER NOT NULL DEFAULT 4,
+  rss_url TEXT,
+  naver_query TEXT,
+  probe_status TEXT NOT NULL DEFAULT 'pending',
+  probe_note TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_sources_tier_active ON media_sources(tier, active);
+
 CREATE TABLE IF NOT EXISTS notifications (
   id TEXT PRIMARY KEY,
   article_id TEXT NOT NULL,
