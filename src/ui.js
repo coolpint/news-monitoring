@@ -13,12 +13,13 @@ function clientMain() {
   const modeLabel = document.getElementById("modeLabel");
 
   function esc(value) {
-    return String(value ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#39;");
+    const input = value === null || value === undefined ? "" : String(value);
+    return input
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   async function api(path, options = {}) {
@@ -29,7 +30,8 @@ function clientMain() {
     }
 
     const res = await fetch(path, init);
-    const isJson = res.headers.get("content-type")?.includes("application/json");
+    const contentType = res.headers.get("content-type") || "";
+    const isJson = contentType.includes("application/json");
     const data = isJson ? await res.json() : null;
     if (!res.ok) {
       throw new Error((data && data.error) || "Request failed (" + res.status + ")");
@@ -43,17 +45,28 @@ function clientMain() {
   }
 
   async function init() {
+    const watchdog = setTimeout(() => {
+      if (!state.bootstrap && !state.me) {
+        setNotice("초기화가 지연되고 있습니다. URL + /api/bootstrap-status 응답을 확인해 주세요.", true);
+      }
+    }, 8000);
+
     try {
       state.bootstrap = await api("/api/bootstrap-status");
       modeLabel.textContent = state.bootstrap.appMode === "single_user_slack"
         ? "Single User Slack Mode"
         : "Multi User Teams Mode";
     } catch (err) {
+      clearTimeout(watchdog);
       setNotice(err.message, true);
       return;
     }
 
-    await refreshSession();
+    try {
+      await refreshSession();
+    } finally {
+      clearTimeout(watchdog);
+    }
   }
 
   async function refreshSession() {
@@ -228,12 +241,17 @@ function clientMain() {
   }
 
   function render() {
-    const notice = state.notice
-      ? `<div class="msg ${state.notice.isError ? "error" : ""}">${esc(state.notice.message)}</div>`
-      : "";
+    try {
+      const notice = state.notice
+        ? `<div class="msg ${state.notice.isError ? "error" : ""}">${esc(state.notice.message)}</div>`
+        : "";
 
-    app.innerHTML = notice + (state.me ? renderDashboard() : renderLogin());
-    bindEvents();
+      app.innerHTML = notice + (state.me ? renderDashboard() : renderLogin());
+      bindEvents();
+    } catch (err) {
+      const message = esc(err && err.message ? err.message : String(err));
+      app.innerHTML = `<section class=\"card\"><h2>UI 초기화 오류</h2><div class=\"msg error\">${message}</div></section>`;
+    }
   }
 
   function bindEvents() {
@@ -435,6 +453,15 @@ function clientMain() {
       });
     });
   }
+
+  window.addEventListener("error", (event) => {
+    setNotice("클라이언트 오류: " + (event.error?.message || event.message || "unknown"), true);
+  });
+
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason && event.reason.message ? event.reason.message : String(event.reason || "unknown");
+    setNotice("비동기 오류: " + reason, true);
+  });
 
   init().catch((err) => setNotice(err.message, true));
 }
