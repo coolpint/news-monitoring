@@ -10,7 +10,12 @@ export default {
     try {
       return await handleRequest(request, env, ctx);
     } catch (error) {
-      console.error("Unhandled error", error);
+      const path = safePath(request.url);
+      const message = error && error.message ? error.message : String(error);
+      console.error("Unhandled error", { path, message, error });
+      if (path.startsWith("/api/")) {
+        return jsonResponse({ error: "Internal Server Error", detail: String(message).slice(0, 600) }, 500);
+      }
       return jsonResponse({ error: "Internal Server Error" }, 500);
     }
   },
@@ -39,6 +44,7 @@ async function handleRequest(request, env) {
   }
 
   if (path === "/api/bootstrap-status" && method === "GET") {
+    await assertCoreSchema(env.DB);
     const countRow = await env.DB.prepare("SELECT COUNT(*) AS count FROM users").first();
     return jsonResponse({
       hasUsers: Number(countRow?.count || 0) > 0,
@@ -126,6 +132,7 @@ async function handleRequest(request, env) {
 }
 
 async function handleBootstrapAdmin(request, env) {
+  await assertCoreSchema(env.DB);
   const countRow = await env.DB.prepare("SELECT COUNT(*) AS count FROM users").first();
   if (Number(countRow?.count || 0) > 0) {
     return jsonResponse({ error: "Admin is already initialized" }, 409);
@@ -153,6 +160,7 @@ async function handleBootstrapAdmin(request, env) {
 }
 
 async function handleLogin(request, env) {
+  await assertCoreSchema(env.DB);
   const body = await readJson(request);
   const email = String(body.email || "").trim().toLowerCase();
   const password = String(body.password || "");
@@ -1087,57 +1095,86 @@ async function verifySessionToken(token, secret) {
 
 async function hashPassword(password) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iterations = 120000;
-  const keyMaterial = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
-  );
-  const bits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      hash: "SHA-256",
-      salt,
-      iterations,
-    },
-    keyMaterial,
-    256,
-  );
+  try {
+    const iterations = 120000;
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"],
+    );
+    const bits = await crypto.subtle.deriveBits(
+      {
+        name: "PBKDF2",
+        hash: "SHA-256",
+        salt,
+        iterations,
+      },
+      keyMaterial,
+      256,
+    );
 
-  return `pbkdf2$${iterations}$${toBase64Url(salt)}$${toBase64Url(new Uint8Array(bits))}`;
+    return `pbkdf2$${iterations}$${toBase64Url(salt)}$${toBase64Url(new Uint8Array(bits))}`;
+  } catch {
+    // Fallback for environments where PBKDF2 deriveBits is unavailable.
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(`${toBase64Url(salt)}:${password}`),
+    );
+    return `sha256$${toBase64Url(salt)}$${toBase64Url(new Uint8Array(digest))}`;
+  }
 }
 
 async function verifyPassword(password, storedHash) {
-  const [algo, itersRaw, saltRaw, hashRaw] = String(storedHash || "").split("$");
-  if (algo !== "pbkdf2") return false;
+  const parts = String(storedHash || "").split("$");
+  const algo = parts[0];
 
-  const iterations = Number(itersRaw);
-  if (!Number.isFinite(iterations) || iterations < 1000) return false;
+  if (algo === "pbkdf2") {
+    const itersRaw = parts[1];
+    const saltRaw = parts[2];
+    const hashRaw = parts[3];
 
-  const salt = fromBase64Url(saltRaw);
-  const expectedHash = hashRaw;
+    const iterations = Number(itersRaw);
+    if (!Number.isFinite(iterations) || iterations < 1000) return false;
 
-  const keyMaterial = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
-  );
-  const bits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      hash: "SHA-256",
-      salt,
-      iterations,
-    },
-    keyMaterial,
-    256,
-  );
-  const computed = toBase64Url(new Uint8Array(bits));
-  return timingSafeEqual(computed, expectedHash);
+    const salt = fromBase64Url(saltRaw);
+    const expectedHash = hashRaw;
+
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"],
+    );
+    const bits = await crypto.subtle.deriveBits(
+      {
+        name: "PBKDF2",
+        hash: "SHA-256",
+        salt,
+        iterations,
+      },
+      keyMaterial,
+      256,
+    );
+    const computed = toBase64Url(new Uint8Array(bits));
+    return timingSafeEqual(computed, expectedHash);
+  }
+
+  if (algo === "sha256") {
+    const saltRaw = parts[1];
+    const expectedHash = parts[2];
+    if (!saltRaw || !expectedHash) return false;
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(`${saltRaw}:${password}`),
+    );
+    const computed = toBase64Url(new Uint8Array(digest));
+    return timingSafeEqual(computed, expectedHash);
+  }
+
+  return false;
 }
 
 async function hmacSha256Base64Url(secret, value) {
@@ -1189,4 +1226,34 @@ function timingSafeEqual(a, b) {
     out |= aa.charCodeAt(i) ^ bb.charCodeAt(i);
   }
   return out === 0;
+}
+
+function safePath(url) {
+  try {
+    return new URL(url).pathname || "/";
+  } catch {
+    return "/";
+  }
+}
+
+async function assertCoreSchema(db) {
+  await assertTableColumns(db, "users", ["id", "email", "name", "password_hash", "role", "active"]);
+}
+
+async function assertTableColumns(db, table, requiredColumns) {
+  const result = await db.prepare(`PRAGMA table_info(${table})`).all();
+  const rows = result.results || [];
+  if (!rows.length) {
+    throw new Error(
+      `Database table '${table}' is missing. Run: npx wrangler d1 execute news_monitoring --remote --file=./sql/schema.sql`,
+    );
+  }
+
+  const existing = new Set(rows.map((row) => String(row.name)));
+  const missing = requiredColumns.filter((name) => !existing.has(name));
+  if (missing.length) {
+    throw new Error(
+      `Database schema mismatch for '${table}'. Missing: ${missing.join(", ")}. Re-run sql/schema.sql migration.`,
+    );
+  }
 }
