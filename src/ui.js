@@ -61,6 +61,23 @@ function clientMain() {
     return selected;
   }
 
+  function channelWebhookPlaceholder(type) {
+    if (type === "telegram") {
+      return "tg://<bot_token>/<chat_id>";
+    }
+    if (type === "slack") {
+      return "https://hooks.slack.com/services/...";
+    }
+    return "https://...";
+  }
+
+  function channelWebhookHint(type) {
+    if (type === "telegram") {
+      return "Telegram은 tg://<bot_token>/<chat_id> 또는 api.telegram.org sendMessage URL(chat_id 포함)을 입력하세요.";
+    }
+    return "";
+  }
+
   async function api(path, options = {}) {
     const init = { ...options };
     init.headers = { "Content-Type": "application/json", ...(options.headers || {}) };
@@ -380,10 +397,10 @@ function clientMain() {
             <select id="chType">
               ${state.bootstrap.appMode === "single_user_slack"
                 ? "<option value='slack'>slack</option>"
-                : "<option value='teams'>teams</option><option value='slack'>slack</option>"}
+                : "<option value='teams'>teams</option><option value='slack'>slack</option><option value='telegram'>telegram</option>"}
             </select>
           </div>
-          <div><label>Webhook URL</label><input id="chWebhook" placeholder="https://..." /></div>
+          <div><label>Webhook URL</label><input id="chWebhook" placeholder="https://..." /><div id="chWebhookHint" class="muted"></div></div>
         </div>
         <div class="btns" style="margin-bottom:10px;"><button id="addChannelBtn">채널 추가</button></div>` : `<div class="muted" style="margin-bottom:10px;">채널 관리는 관리자만 가능합니다. 알림은 전체 활성 채널로 공통 발송됩니다.</div>`}
         <table>
@@ -412,6 +429,21 @@ function clientMain() {
   }
 
   function bindEvents() {
+    const chType = document.getElementById("chType");
+    const chWebhook = document.getElementById("chWebhook");
+    const chWebhookHint = document.getElementById("chWebhookHint");
+    if (chType && chWebhook) {
+      const applyChannelInputs = () => {
+        const type = String(chType.value || "teams");
+        chWebhook.placeholder = channelWebhookPlaceholder(type);
+        if (chWebhookHint) {
+          chWebhookHint.textContent = channelWebhookHint(type);
+        }
+      };
+      chType.addEventListener("change", applyChannelInputs);
+      applyChannelInputs();
+    }
+
     const loginBtn = document.getElementById("loginBtn");
     if (loginBtn) {
       loginBtn.addEventListener("click", async () => {

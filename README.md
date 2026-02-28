@@ -1,6 +1,6 @@
 # News Monitoring (Cloudflare Worker)
 
-뉴스 키워드 모니터링 알림을 `5분 주기`로 수집하고, 키워드 소유자와 무관하게 `전체 활성 Teams/Slack 채널`로 공통 발송하는 웹앱입니다.
+뉴스 키워드 모니터링 알림을 `5분 주기`로 수집하고, 키워드 소유자와 무관하게 `전체 활성 Teams/Slack/Telegram 채널`로 공통 발송하는 웹앱입니다.
 
 - 기본 모드: `multi_user_teams` (회사 사용자별 키워드 + Teams 중심)
 - 대체 모드: `single_user_slack` (1인 운영 + Slack 중심)
@@ -13,7 +13,7 @@
 - 주제어 그룹 기능(`주제어>검색어` 라벨로 알림 식별)
 - 매체 티어 기반 필터(티어1~티어4)
 - 매체 URL 등록 + RSS/네이버 가능 여부 자동 검사
-- 전역 알림 채널(Teams/Slack webhook) 관리
+- 전역 알림 채널(Teams/Slack/Telegram) 관리
 - 5분 크론 수집(`*/5 * * * *`)
 - 중복 기사 방지(해시 키 기반)
 - 수동 실행 버튼 + 실행 이력 확인
@@ -24,7 +24,7 @@
 1. `scheduled` 이벤트(5분) 또는 수동 실행 호출
 2. 활성 키워드 쿼리별 RSS 수집(`google_rss`)
 3. 기사 중복 제거 후 `notifications` 큐 적재
-4. 채널별로 묶어 Teams/Slack 웹훅 발송
+4. 채널별로 묶어 Teams/Slack/Telegram 발송
 5. 결과를 `poll_runs`에 저장
 
 ## 키워드 검색 규칙
@@ -115,7 +115,7 @@ MAX_CUSTOM_RSS_SOURCES_PER_RUN = "20"
 ### multi_user_teams
 
 - 관리자 계정으로 사내 사용자 추가
-- 전역 Teams/Slack 채널 등록(키워드 소유자와 무관하게 공통 발송)
+- 전역 Teams/Slack/Telegram 채널 등록(키워드 소유자와 무관하게 공통 발송)
 - 사용자별 키워드 운영
 
 ### single_user_slack
@@ -128,6 +128,15 @@ MAX_CUSTOM_RSS_SOURCES_PER_RUN = "20"
 
 - Teams는 기존 Connector 대신 Workflows 웹훅 방식이 권장됩니다.
 - 환경에 따라 payload 형식이 달라질 수 있어, 코드에서 기본 text payload 실패 시 Adaptive Card payload를 재시도하도록 구현되어 있습니다.
+
+## Telegram 설정 팁
+
+- BotFather에서 봇 생성 후 `bot token` 발급
+- 알림 받을 채팅(개인/그룹)의 `chat_id` 확인
+- 채널 추가 시 타입을 `telegram`으로 선택
+- Webhook URL 입력 형식:
+  - `tg://<bot_token>/<chat_id>` (권장)
+  - 또는 `https://api.telegram.org/bot<bot_token>/sendMessage?chat_id=<chat_id>`
 
 ## GitHub에 커밋만 하면 되나?
 

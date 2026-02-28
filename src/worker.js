@@ -524,14 +524,14 @@ async function diagnoseKeyword(env, user, keywordId) {
   }
 
   const channelsRes = await env.DB.prepare(
-    `SELECT id, name, type, active
+    `SELECT id, name, type, webhook_url, active
      FROM channels
      ORDER BY created_at DESC`,
   ).all();
   const channels = (channelsRes.results || []).map((ch) => ({
     id: ch.id,
     name: ch.name,
-    type: ch.type,
+    type: resolveChannelType(ch.type, ch.webhook_url),
     active: Number(ch.active) === 1,
   }));
   const activeChannelIds = channels.filter((ch) => ch.active).map((ch) => ch.id);
@@ -617,6 +617,7 @@ async function listChannels(env, user) {
 
   const channels = (res.results || []).map((row) => ({
     ...row,
+    type: resolveChannelType(row.type, row.webhook_url),
     active: Number(row.active) === 1,
   }));
 
@@ -632,19 +633,20 @@ async function createChannel(request, env, user) {
   const name = String(body.name || "").trim();
   const requestedType = String(body.type || "teams").trim().toLowerCase();
   const appMode = getAppMode(env);
-  const type = appMode === "single_user_slack" ? "slack" : requestedType;
-  const webhookUrl = String(body.webhookUrl || "").trim();
+  if (appMode === "single_user_slack" && requestedType !== "slack") {
+    return jsonResponse({ error: "single_user_slack mode only allows slack" }, 403);
+  }
+  const requestedChannelType = appMode === "single_user_slack" ? "slack" : requestedType;
+  const type = requestedChannelType === "telegram" ? "slack" : requestedChannelType;
+  const webhookUrlInput = String(body.webhookUrl || "").trim();
+  const webhookUrl = normalizeWebhookByType(requestedChannelType, webhookUrlInput);
 
-  if (!name || !isValidWebhook(webhookUrl)) {
+  if (!name || !webhookUrl || !isValidWebhookByType(requestedChannelType, webhookUrl)) {
     return jsonResponse({ error: "Invalid channel name or webhook URL" }, 400);
   }
 
-  if (!["teams", "slack"].includes(type)) {
-    return jsonResponse({ error: "channel type must be teams/slack" }, 400);
-  }
-
-  if (appMode === "single_user_slack" && type !== "slack") {
-    return jsonResponse({ error: "single_user_slack mode only allows slack" }, 403);
+  if (!["teams", "slack", "telegram"].includes(requestedChannelType)) {
+    return jsonResponse({ error: "channel type must be teams/slack/telegram" }, 400);
   }
 
   const userId = user.id;
@@ -665,7 +667,7 @@ async function patchChannel(request, env, user, channelId) {
     return jsonResponse({ error: "Admin only" }, 403);
   }
 
-  const row = await env.DB.prepare("SELECT id, user_id FROM channels WHERE id = ? LIMIT 1")
+  const row = await env.DB.prepare("SELECT id, user_id, type, webhook_url FROM channels WHERE id = ? LIMIT 1")
     .bind(channelId)
     .first();
   if (!row) return jsonResponse({ error: "Channel not found" }, 404);
@@ -679,8 +681,10 @@ async function patchChannel(request, env, user, channelId) {
     params.push(String(body.name || "").trim());
   }
   if (body.webhookUrl !== undefined) {
-    const webhookUrl = String(body.webhookUrl || "").trim();
-    if (!isValidWebhook(webhookUrl)) {
+    const channelType = resolveChannelType(row.type, row.webhook_url);
+    const webhookUrlInput = String(body.webhookUrl || "").trim();
+    const webhookUrl = normalizeWebhookByType(channelType, webhookUrlInput);
+    if (!webhookUrl || !isValidWebhookByType(channelType, webhookUrl)) {
       return jsonResponse({ error: "Invalid webhook URL" }, 400);
     }
     fields.push("webhook_url = ?");
@@ -1175,11 +1179,15 @@ async function runPoll(env, triggerType) {
     const groupedByChannel = groupByChannel(pendingWithPath);
     for (const batch of groupedByChannel.values()) {
       const first = batch[0];
-      const chunks = chunkRows(batch, 20);
+      const channelType = resolveChannelType(first.type, first.webhook_url);
+      const chunkSize = channelType === "telegram" ? 5 : 20;
+      const chunks = chunkRows(batch, chunkSize);
       for (const chunk of chunks) {
-        const sendResult = first.type === "slack"
-          ? await sendSlackWebhook(first.webhook_url, chunk)
-          : await sendTeamsWebhook(first.webhook_url, chunk);
+        const sendResult = channelType === "telegram"
+          ? await sendTelegramWebhook(first.webhook_url, chunk)
+          : channelType === "slack"
+            ? await sendSlackWebhook(first.webhook_url, chunk)
+            : await sendTeamsWebhook(first.webhook_url, chunk);
 
         if (sendResult.ok) {
           sentNotifications += chunk.length;
@@ -1884,6 +1892,45 @@ async function sendSlackWebhook(webhookUrl, batch) {
   };
 }
 
+async function sendTelegramWebhook(webhookUrl, batch) {
+  const target = parseTelegramTarget(webhookUrl);
+  if (!target) {
+    return { ok: false, error: "Telegram target format is invalid" };
+  }
+
+  const headerText = `뉴스 알림 ${batch.length}건`;
+  const bodyText = batch
+    .map((item, idx) => {
+      const stamp = item.published_at ? ` (${new Date(item.published_at).toLocaleString("ko-KR")})` : "";
+      const keywordLabel = item.keyword_path || item.keyword_label;
+      return `${idx + 1}. [${keywordLabel}] ${item.title}${stamp}\n${item.url}`;
+    })
+    .join("\n\n");
+
+  const text = `${headerText}\n\n${bodyText}`;
+  const endpoint = `https://api.telegram.org/bot${target.token}/sendMessage`;
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chat_id: target.chatId,
+      text: text.slice(0, 3900),
+      disable_web_page_preview: true,
+    }),
+  });
+
+  if (res.ok) {
+    return { ok: true };
+  }
+
+  const errorText = await res.text();
+  return {
+    ok: false,
+    error: `Telegram sendMessage failed (${res.status}): ${errorText.slice(0, 240)}`,
+  };
+}
+
 async function readJson(request) {
   const text = await request.text();
   if (!text) return {};
@@ -2070,12 +2117,75 @@ function isValidEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
+function resolveChannelType(type, webhookUrl) {
+  if (type === "slack" && looksLikeTelegramTarget(webhookUrl)) {
+    return "telegram";
+  }
+  return type;
+}
+
+function isValidWebhookByType(type, value) {
+  if (type === "telegram") {
+    return Boolean(parseTelegramTarget(value));
+  }
+  return isValidWebhook(value);
+}
+
+function normalizeWebhookByType(type, value) {
+  const raw = String(value || "").trim();
+  if (type !== "telegram") {
+    return raw;
+  }
+  const target = parseTelegramTarget(raw);
+  if (!target) return "";
+  return `tg://${target.token}/${target.chatId}`;
+}
+
 function isValidWebhook(value) {
   try {
     const url = new URL(value);
     return url.protocol === "https:";
   } catch {
     return false;
+  }
+}
+
+function looksLikeTelegramTarget(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  if (raw.startsWith("tg://")) return true;
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:"
+      && url.hostname.toLowerCase() === "api.telegram.org"
+      && /^\/bot[^/]+\/sendMessage$/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function parseTelegramTarget(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  if (raw.startsWith("tg://")) {
+    const match = raw.match(/^tg:\/\/([^/\s]+)\/([^/\s?#]+)$/i);
+    if (!match) return null;
+    return { token: match[1], chatId: match[2] };
+  }
+
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:") return null;
+    if (url.hostname.toLowerCase() !== "api.telegram.org") return null;
+    const pathMatch = url.pathname.match(/^\/bot([^/]+)\/sendMessage$/i);
+    if (!pathMatch) return null;
+    const token = pathMatch[1];
+    const chatId = (url.searchParams.get("chat_id") || "").trim();
+    if (!chatId) return null;
+    return { token, chatId };
+  } catch {
+    return null;
   }
 }
 
