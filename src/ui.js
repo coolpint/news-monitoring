@@ -217,21 +217,41 @@ function clientMain() {
       </tr>
     `).join("");
 
-    const tierCards = (state.mediaCatalog.tiers || []).map((tierInfo) => `
-      <div class="tier-card">
-        <div class="tier-head">
-          <span class="tier-dot t${tierInfo.tier}"></span>
-          <strong>${esc(tierInfo.label)}</strong>
-          <span class="muted">${tierInfo.predefined_count}</span>
-        </div>
-        <div class="tier-list">
-          ${(tierInfo.predefined_sources || []).slice(0, 12).map((source) => `<span class="pill">${esc(source)}</span>`).join(" ")}
-          ${(tierInfo.predefined_count || 0) > 12 ? `<span class="muted">+${tierInfo.predefined_count - 12}</span>` : ""}
-        </div>
-      </div>
-    `).join("");
-
     const mediaSearch = state.mediaSearch.trim().toLowerCase();
+    const filteredMediaSources = (state.mediaSources || [])
+      .filter((item) => {
+        if (!mediaSearch) return true;
+        const haystack = `${item.name || ""} ${item.domain || ""} ${item.site_url || ""}`.toLowerCase();
+        return haystack.includes(mediaSearch);
+      })
+      .sort((a, b) => {
+        const tierDiff = Number(a.tier || 4) - Number(b.tier || 4);
+        if (tierDiff !== 0) return tierDiff;
+        return String(a.name || a.domain || "").localeCompare(String(b.name || b.domain || ""), "ko");
+      });
+
+    const tierBoardColumns = [1, 2, 3, 4].map((tier) => {
+      const items = filteredMediaSources.filter((item) => Number(item.tier || 4) === tier);
+      const cards = items.map((item) => `
+        <div class="media-chip ${isAdmin ? "draggable" : ""}" ${isAdmin ? "draggable='true'" : ""} data-media-drag-id="${item.id}" data-current-tier="${tier}">
+          <div class="media-chip-name">${esc(item.name || item.domain || "-")}</div>
+          <div class="media-chip-sub">${esc(item.domain || "-")}</div>
+        </div>
+      `).join("");
+      const dropAttr = isAdmin ? ` data-tier-dropzone="${tier}"` : "";
+      return `
+        <div class="tier-column t${tier}"${dropAttr}>
+          <div class="tier-column-head">
+            <span><span class="tier-dot t${tier}"></span>티어 ${tier}</span>
+            <span class="muted">${items.length}</span>
+          </div>
+          <div class="tier-column-list">
+            ${cards || "<div class='muted empty-drop'>비어 있음</div>"}
+          </div>
+        </div>
+      `;
+    }).join("");
+
     const discoveredRows = (state.mediaCatalog.discovered || [])
       .filter((item) => {
         if (!mediaSearch) return true;
@@ -397,7 +417,8 @@ function clientMain() {
           <tbody>${mediaSourceRows || `<tr><td colspan='${isAdmin ? "9" : "8"}' class='muted'>등록된 매체가 없습니다.</td></tr>`}</tbody>
         </table>
 
-        <div class="tier-grid">${tierCards || "<div class='muted'>티어 정보 없음</div>"}</div>
+        <div class="muted" style="margin:12px 0 8px;">${isAdmin ? "티어 보드 (카드를 드래그해서 다른 티어 컬럼으로 이동)" : "티어 보드"}</div>
+        <div class="tier-board">${tierBoardColumns || "<div class='muted'>티어 보드 데이터 없음</div>"}</div>
         <table style="margin-top:12px;">
           <thead><tr><th>매체</th><th>티어</th><th>도메인</th><th>수집건수</th></tr></thead>
           <tbody>${discoveredRows || "<tr><td colspan='4' class='muted'>수집된 매체 데이터가 아직 없습니다.</td></tr>"}</tbody>
@@ -526,6 +547,61 @@ function clientMain() {
       mediaSearchInput.addEventListener("input", () => {
         state.mediaSearch = mediaSearchInput.value;
         render();
+      });
+    }
+
+    if (state.me && state.me.role === "admin") {
+      let draggingMediaId = "";
+      app.querySelectorAll("[data-media-drag-id]").forEach((el) => {
+        el.addEventListener("dragstart", (event) => {
+          draggingMediaId = String(el.dataset.mediaDragId || "");
+          el.classList.add("dragging");
+          if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", draggingMediaId);
+          }
+        });
+        el.addEventListener("dragend", () => {
+          el.classList.remove("dragging");
+          draggingMediaId = "";
+          app.querySelectorAll("[data-tier-dropzone].over").forEach((zone) => zone.classList.remove("over"));
+        });
+      });
+
+      app.querySelectorAll("[data-tier-dropzone]").forEach((zone) => {
+        zone.addEventListener("dragover", (event) => {
+          event.preventDefault();
+          zone.classList.add("over");
+          if (event.dataTransfer) {
+            event.dataTransfer.dropEffect = "move";
+          }
+        });
+        zone.addEventListener("dragleave", () => {
+          zone.classList.remove("over");
+        });
+        zone.addEventListener("drop", async (event) => {
+          event.preventDefault();
+          zone.classList.remove("over");
+          const dropTier = Number(zone.dataset.tierDropzone || 0);
+          const droppedId = (event.dataTransfer && event.dataTransfer.getData("text/plain")) || draggingMediaId;
+          if (!dropTier || !droppedId) return;
+
+          const current = (state.mediaSources || []).find((x) => x.id === droppedId);
+          if (!current) return;
+          if (Number(current.tier || 4) === dropTier) return;
+
+          try {
+            await api("/api/media-sources/" + droppedId, {
+              method: "PATCH",
+              body: { tier: dropTier },
+            });
+            setNotice(`티어 이동 완료: ${current.name || current.domain} → T${dropTier}`);
+            await loadData();
+            render();
+          } catch (err) {
+            setNotice(err.message, true);
+          }
+        });
       });
     }
 
@@ -1036,6 +1112,71 @@ export function renderAppShell() {
         color: var(--ink);
         margin-bottom: 4px;
       }
+      .tier-board {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .tier-column {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: #fbfefd;
+        min-height: 260px;
+        display: flex;
+        flex-direction: column;
+      }
+      .tier-column-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        padding: 10px;
+        border-bottom: 1px dashed var(--line);
+      }
+      .tier-column-head span:first-child {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.84rem;
+        font-weight: 700;
+      }
+      .tier-column-list {
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-height: 200px;
+      }
+      .tier-column.over {
+        border-color: var(--brand);
+        box-shadow: inset 0 0 0 2px rgba(11, 143, 107, 0.18);
+      }
+      .media-chip {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        padding: 8px;
+      }
+      .media-chip.draggable {
+        cursor: grab;
+      }
+      .media-chip.dragging {
+        opacity: 0.4;
+      }
+      .media-chip-name {
+        font-size: 0.83rem;
+        font-weight: 600;
+        line-height: 1.3;
+      }
+      .media-chip-sub {
+        font-size: 0.73rem;
+        color: var(--sub);
+        margin-top: 2px;
+        word-break: break-all;
+      }
+      .empty-drop {
+        padding: 8px 4px;
+      }
       .tier-grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -1088,6 +1229,14 @@ export function renderAppShell() {
         }
         .media-head input {
           max-width: none;
+        }
+        .tier-board {
+          grid-template-columns: 1fr;
+        }
+      }
+      @media (max-width: 1180px) and (min-width: 721px) {
+        .tier-board {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
         }
       }
     </style>
