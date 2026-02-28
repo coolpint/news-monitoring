@@ -1,0 +1,14 @@
+{
+  "name": "news-monitoring",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate": "wrangler d1 execute news_monitoring --file=./sql/schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.11.1"
+  }
+}
