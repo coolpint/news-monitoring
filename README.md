@@ -64,6 +64,21 @@ npx wrangler deploy
 - 최초 1회 관리자 계정 생성
 - 관리자 로그인 후 사용자/키워드/채널 설정
 
+## 로컬 꺼도 계속 동작하게 만들기 (권장 순서)
+
+한 번만 아래를 완료하면, 이후에는 로컬 PC가 꺼져 있어도 Cloudflare에서 24시간 동작합니다.
+
+1. `wrangler.toml`의 `database_id`를 실제 D1 ID로 수정
+2. `SESSION_SECRET` 시크릿 등록
+3. `npx wrangler d1 execute news_monitoring --remote --file=./sql/schema.sql` 실행
+4. `npx wrangler deploy` 실행
+5. Cloudflare Dashboard에서 Cron Trigger가 `*/5 * * * *`로 보이는지 확인
+6. Worker URL 접속 후 관리자 계정 생성
+7. Teams webhook 채널 + 키워드 등록
+8. UI의 `지금 수집 실행` 버튼으로 테스트 알림 확인
+
+이 상태가 되면 스케줄 실행, 데이터 저장(D1), 알림 발송이 모두 Cloudflare에서 수행됩니다.
+
 ## 모드 전환
 
 `wrangler.toml`의 `APP_MODE`를 변경합니다.
@@ -105,6 +120,17 @@ MAX_KEYWORDS_PER_USER = "40"
 
 즉, 원격에서 계속 돌리려면 Cloudflare 배포까지 완료되어야 합니다.
 
+## GitHub 자동 배포 (선택)
+
+`.github/workflows/deploy.yml`이 포함되어 있어, `main` 푸시 때 자동 배포할 수 있습니다.
+
+GitHub 저장소 `Settings > Secrets and variables > Actions`에 아래 두 개를 추가하세요.
+
+- `CLOUDFLARE_API_TOKEN`: Workers/D1 배포 권한이 있는 토큰
+- `CLOUDFLARE_ACCOUNT_ID`: Cloudflare Account ID
+
+초기 1회는 로컬에서 D1 생성/스키마 적용이 필요하고, 그 이후 코드 변경은 GitHub 푸시로 자동 배포할 수 있습니다.
+
 ## 무료 티어 관점 운영 가이드
 
 - 5분 주기면 하루 288회 실행
@@ -119,3 +145,4 @@ MAX_KEYWORDS_PER_USER = "40"
 - 엔트리: `src/worker.js`
 - UI: `src/ui.js`
 - DB 스키마: `sql/schema.sql`
+- GitHub Actions: `.github/workflows/deploy.yml`
