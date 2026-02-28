@@ -263,6 +263,8 @@ async function listKeywords(env, user) {
     return {
       ...row,
       query: config.compiledQuery,
+      topic_label: config.topicLabel,
+      keyword_path: buildKeywordPath(config.topicLabel, row.label),
       search_terms: config.searchTerms,
       must_include_terms: config.mustIncludeTerms,
       exclude_terms: config.excludeTerms,
@@ -276,6 +278,7 @@ async function listKeywords(env, user) {
 async function createKeyword(request, env, user) {
   const body = await readJson(request);
   const label = String(body.label || "").trim();
+  const topicLabel = collapseSpace(String(body.topicLabel || ""));
   const source = String(body.source || "google_rss").trim();
   const searchTerms = normalizeSearchTermsInput(body.searchTerms, body.query);
   const mustIncludeTerms = normalizeTermArray(body.mustIncludeTerms);
@@ -312,7 +315,7 @@ async function createKeyword(request, env, user) {
       userId,
       label,
       query,
-      JSON.stringify({ searchTerms, mustIncludeTerms, excludeTerms }),
+      JSON.stringify({ topicLabel, searchTerms, mustIncludeTerms, excludeTerms }),
       source,
     )
     .run();
@@ -350,8 +353,16 @@ async function patchKeyword(request, env, user, keywordId) {
     params.push(Number(body.active) ? 1 : 0);
   }
 
-  if (body.searchTerms !== undefined || body.mustIncludeTerms !== undefined || body.excludeTerms !== undefined) {
+  if (
+    body.searchTerms !== undefined ||
+    body.mustIncludeTerms !== undefined ||
+    body.excludeTerms !== undefined ||
+    body.topicLabel !== undefined
+  ) {
     const current = parseKeywordConfig(row);
+    const nextTopicLabel = body.topicLabel !== undefined
+      ? collapseSpace(String(body.topicLabel || ""))
+      : current.topicLabel;
     const nextSearchTerms = body.searchTerms !== undefined
       ? normalizeSearchTermsInput(body.searchTerms, undefined)
       : current.searchTerms;
@@ -370,6 +381,7 @@ async function patchKeyword(request, env, user, keywordId) {
     params.push(buildExactOrQuery(nextSearchTerms));
     fields.push("exclude_terms = ?");
     params.push(JSON.stringify({
+      topicLabel: nextTopicLabel,
       searchTerms: nextSearchTerms,
       mustIncludeTerms: nextMustIncludeTerms,
       excludeTerms: nextExcludeTerms,
@@ -695,7 +707,7 @@ async function runPoll(env, triggerType) {
     const pendingRows = await db.prepare(
       `SELECT n.id AS notification_id, n.channel_id,
               a.title, a.url, a.published_at,
-              k.label AS keyword_label, k.query,
+              k.label AS keyword_label, k.query, k.exclude_terms,
               c.type, c.webhook_url,
               u.name AS user_name
        FROM notifications n
@@ -707,7 +719,14 @@ async function runPoll(env, triggerType) {
        ORDER BY n.created_at ASC`,
     ).all();
 
-    const groupedByChannel = groupByChannel(pendingRows.results || []);
+    const pendingWithPath = (pendingRows.results || []).map((row) => {
+      const config = parseKeywordConfig({ query: row.query, exclude_terms: row.exclude_terms });
+      return {
+        ...row,
+        keyword_path: buildKeywordPath(config.topicLabel, row.keyword_label),
+      };
+    });
+    const groupedByChannel = groupByChannel(pendingWithPath);
     for (const batch of groupedByChannel.values()) {
       const first = batch[0];
       const sendResult = first.type === "slack"
@@ -981,7 +1000,8 @@ async function sendTeamsWebhook(webhookUrl, batch) {
   const title = `뉴스 알림 ${batch.length}건`;
   const lines = batch.slice(0, 20).map((item, index) => {
     const stamp = item.published_at ? ` (${new Date(item.published_at).toLocaleString("ko-KR")})` : "";
-    return `${index + 1}. [${item.keyword_label}] ${item.title}${stamp}\n${item.url}`;
+    const keywordLabel = item.keyword_path || item.keyword_label;
+    return `${index + 1}. [${keywordLabel}] ${item.title}${stamp}\n${item.url}`;
   });
   const text = `${title}\n\n${lines.join("\n\n")}`;
 
@@ -1011,7 +1031,7 @@ async function sendTeamsWebhook(webhookUrl, batch) {
             ...batch.slice(0, 20).map((item, index) => ({
               type: "TextBlock",
               wrap: true,
-              text: `${index + 1}. [${item.keyword_label}] ${item.title}\n${item.url}`,
+              text: `${index + 1}. [${item.keyword_path || item.keyword_label}] ${item.title}\n${item.url}`,
             })),
           ],
         },
@@ -1042,7 +1062,8 @@ async function sendSlackWebhook(webhookUrl, batch) {
     .slice(0, 20)
     .map((item, idx) => {
       const stamp = item.published_at ? ` (${new Date(item.published_at).toLocaleString("ko-KR")})` : "";
-      return `${idx + 1}. *[${item.keyword_label}]* ${item.title}${stamp}\n${item.url}`;
+      const keywordLabel = item.keyword_path || item.keyword_label;
+      return `${idx + 1}. *[${keywordLabel}]* ${item.title}${stamp}\n${item.url}`;
     })
     .join("\n\n");
 
@@ -1120,6 +1141,7 @@ function parseKeywordConfig(row) {
     const searchTerms = normalizeSearchTermsInput(undefined, compiledQueryRaw);
     return {
       compiledQuery: compiledQueryRaw || buildExactOrQuery(searchTerms),
+      topicLabel: "",
       searchTerms,
       mustIncludeTerms: [],
       excludeTerms: normalizeTermArray(parsed),
@@ -1127,6 +1149,7 @@ function parseKeywordConfig(row) {
   }
 
   if (parsed && typeof parsed === "object") {
+    const topicLabel = collapseSpace(String(parsed.topicLabel || parsed.topic || ""));
     const searchTerms = normalizeSearchTermsInput(parsed.searchTerms, compiledQueryRaw);
     const resolvedSearchTerms = searchTerms.length
       ? searchTerms
@@ -1135,6 +1158,7 @@ function parseKeywordConfig(row) {
     const excludeTerms = normalizeTermArray(parsed.excludeTerms);
     return {
       compiledQuery: buildExactOrQuery(resolvedSearchTerms) || compiledQueryRaw,
+      topicLabel,
       searchTerms: resolvedSearchTerms,
       mustIncludeTerms,
       excludeTerms,
@@ -1144,10 +1168,20 @@ function parseKeywordConfig(row) {
   const fallbackSearchTerms = normalizeSearchTermsInput(undefined, compiledQueryRaw);
   return {
     compiledQuery: compiledQueryRaw || buildExactOrQuery(fallbackSearchTerms),
+    topicLabel: "",
     searchTerms: fallbackSearchTerms,
     mustIncludeTerms: [],
     excludeTerms: [],
   };
+}
+
+function buildKeywordPath(topicLabel, keywordLabel) {
+  const topic = collapseSpace(String(topicLabel || ""));
+  const keyword = collapseSpace(String(keywordLabel || ""));
+  if (topic && keyword) {
+    return `${topic}>${keyword}`;
+  }
+  return topic || keyword;
 }
 
 function normalizeSearchTermsInput(searchTerms, queryFallback) {

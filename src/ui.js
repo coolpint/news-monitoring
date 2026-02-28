@@ -132,13 +132,14 @@ function clientMain() {
   function renderDashboard() {
     const keywordRows = state.keywords.map((k) => `
       <tr>
-        <td>${esc(k.label)}</td>
+        <td>${esc(k.keyword_path || ((k.topic_label ? `${k.topic_label}>` : "") + (k.label || "")))}</td>
         <td>${(k.search_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${(k.must_include_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${(k.exclude_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${k.active ? "ON" : "OFF"}</td>
         <td>
           <div class="btns">
+            <button class="ghost" data-action="set-topic" data-id="${k.id}" data-topic="${esc(k.topic_label || "")}">주제어 변경</button>
             <button class="ghost" data-action="toggle-keyword" data-id="${k.id}" data-active="${k.active ? 1 : 0}">${k.active ? "중지" : "활성화"}</button>
             <button class="warn" data-action="delete-keyword" data-id="${k.id}">삭제</button>
           </div>
@@ -204,12 +205,14 @@ function clientMain() {
         <section class="card">
           <h2>키워드</h2>
           <div class="muted" style="margin-bottom:10px;">검색어는 정확 일치로 처리되며 여러 개 입력 시 OR 조건으로 동작합니다.</div>
+          <div class="muted" style="margin-bottom:10px;">주제어를 입력하면 알림 라벨이 주제어&gt;검색어 형태로 표시됩니다.</div>
           <table>
-            <thead><tr><th>라벨</th><th>검색어(OR)</th><th>꼭 포함</th><th>제외</th><th>상태</th><th>관리</th></tr></thead>
+            <thead><tr><th>주제어&gt;검색어</th><th>검색어(OR)</th><th>꼭 포함</th><th>제외</th><th>상태</th><th>관리</th></tr></thead>
             <tbody>${keywordRows || "<tr><td colspan='6' class='muted'>아직 키워드가 없습니다.</td></tr>"}</tbody>
           </table>
           <div class="row inline" style="margin-top:10px;">
-            <div><label>라벨</label><input id="kwLabel" placeholder="예: 경쟁사A" /></div>
+            <div><label>주제어 그룹</label><input id="kwTopic" placeholder="예: 지바이크" /></div>
+            <div><label>검색어 이름</label><input id="kwLabel" placeholder="예: 경쟁사" /></div>
             <div><label>검색어(쉼표/줄바꿈)</label><input id="kwSearchTerms" placeholder="예: 회사명, 브랜드명" /></div>
             <div><label>꼭 포함(쉼표/줄바꿈)</label><input id="kwMustInclude" placeholder="예: 투자유치, 신제품" /></div>
             <div><label>제외어(쉼표/줄바꿈)</label><input id="kwExclude" placeholder="예: 채용, 공고" /></div>
@@ -348,6 +351,7 @@ function clientMain() {
           await api("/api/keywords", {
             method: "POST",
             body: {
+              topicLabel: document.getElementById("kwTopic").value,
               label: document.getElementById("kwLabel").value,
               searchTerms: parseTermInput(document.getElementById("kwSearchTerms").value),
               mustIncludeTerms: parseTermInput(document.getElementById("kwMustInclude").value),
@@ -425,6 +429,25 @@ function clientMain() {
             method: "PATCH",
             body: { active: Number(el.dataset.active) === 1 ? 0 : 1 },
           });
+          await loadData();
+          render();
+        } catch (err) {
+          setNotice(err.message, true);
+        }
+      });
+    });
+
+    app.querySelectorAll("button[data-action='set-topic']").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const nextTopic = window.prompt("주제어 그룹을 입력하세요. 비워두면 해제됩니다.", el.dataset.topic || "");
+        if (nextTopic === null) return;
+
+        try {
+          await api("/api/keywords/" + el.dataset.id, {
+            method: "PATCH",
+            body: { topicLabel: nextTopic },
+          });
+          setNotice("주제어 그룹을 변경했습니다.");
           await loadData();
           render();
         } catch (err) {
