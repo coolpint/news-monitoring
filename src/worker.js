@@ -258,11 +258,17 @@ async function listKeywords(env, user) {
     ? await env.DB.prepare(sql).bind(...params).all()
     : await env.DB.prepare(sql).all();
 
-  const keywords = (res.results || []).map((row) => ({
-    ...row,
-    active: Number(row.active) === 1,
-    exclude_terms: safeJsonArray(row.exclude_terms),
-  }));
+  const keywords = (res.results || []).map((row) => {
+    const config = parseKeywordConfig(row);
+    return {
+      ...row,
+      query: config.compiledQuery,
+      search_terms: config.searchTerms,
+      must_include_terms: config.mustIncludeTerms,
+      exclude_terms: config.excludeTerms,
+      active: Number(row.active) === 1,
+    };
+  });
 
   return jsonResponse({ keywords });
 }
@@ -270,14 +276,14 @@ async function listKeywords(env, user) {
 async function createKeyword(request, env, user) {
   const body = await readJson(request);
   const label = String(body.label || "").trim();
-  const query = String(body.query || "").trim();
   const source = String(body.source || "google_rss").trim();
-  const excludeTerms = Array.isArray(body.excludeTerms)
-    ? body.excludeTerms.map((x) => String(x).trim()).filter(Boolean)
-    : [];
+  const searchTerms = normalizeSearchTermsInput(body.searchTerms, body.query);
+  const mustIncludeTerms = normalizeTermArray(body.mustIncludeTerms);
+  const excludeTerms = normalizeTermArray(body.excludeTerms);
+  const query = buildExactOrQuery(searchTerms);
 
-  if (!label || !query) {
-    return jsonResponse({ error: "label and query are required" }, 400);
+  if (!label || !searchTerms.length) {
+    return jsonResponse({ error: "label and at least one search term are required" }, 400);
   }
 
   if (source !== "google_rss") {
@@ -301,14 +307,21 @@ async function createKeyword(request, env, user) {
     `INSERT INTO keywords (id, user_id, label, query, exclude_terms, source, active)
      VALUES (?, ?, ?, ?, ?, ?, 1)`,
   )
-    .bind(id, userId, label, query, JSON.stringify(excludeTerms), source)
+    .bind(
+      id,
+      userId,
+      label,
+      query,
+      JSON.stringify({ searchTerms, mustIncludeTerms, excludeTerms }),
+      source,
+    )
     .run();
 
   return jsonResponse({ ok: true, id });
 }
 
 async function patchKeyword(request, env, user, keywordId) {
-  const row = await env.DB.prepare("SELECT id, user_id FROM keywords WHERE id = ? LIMIT 1")
+  const row = await env.DB.prepare("SELECT id, user_id, query, exclude_terms FROM keywords WHERE id = ? LIMIT 1")
     .bind(keywordId)
     .first();
   if (!row) return jsonResponse({ error: "Keyword not found" }, 404);
@@ -325,19 +338,42 @@ async function patchKeyword(request, env, user, keywordId) {
     params.push(String(body.label || "").trim());
   }
   if (body.query !== undefined) {
-    fields.push("query = ?");
-    params.push(String(body.query || "").trim());
-  }
-  if (body.excludeTerms !== undefined) {
-    const excludeTerms = Array.isArray(body.excludeTerms)
-      ? body.excludeTerms.map((x) => String(x).trim()).filter(Boolean)
-      : [];
-    fields.push("exclude_terms = ?");
-    params.push(JSON.stringify(excludeTerms));
+    // Backward compatibility path: query text can still be sent from old clients.
+    const parsedTerms = normalizeSearchTermsInput(undefined, body.query);
+    if (!parsedTerms.length) {
+      return jsonResponse({ error: "At least one search term is required" }, 400);
+    }
+    body.searchTerms = parsedTerms;
   }
   if (body.active !== undefined) {
     fields.push("active = ?");
     params.push(Number(body.active) ? 1 : 0);
+  }
+
+  if (body.searchTerms !== undefined || body.mustIncludeTerms !== undefined || body.excludeTerms !== undefined) {
+    const current = parseKeywordConfig(row);
+    const nextSearchTerms = body.searchTerms !== undefined
+      ? normalizeSearchTermsInput(body.searchTerms, undefined)
+      : current.searchTerms;
+    const nextMustIncludeTerms = body.mustIncludeTerms !== undefined
+      ? normalizeTermArray(body.mustIncludeTerms)
+      : current.mustIncludeTerms;
+    const nextExcludeTerms = body.excludeTerms !== undefined
+      ? normalizeTermArray(body.excludeTerms)
+      : current.excludeTerms;
+
+    if (!nextSearchTerms.length) {
+      return jsonResponse({ error: "At least one search term is required" }, 400);
+    }
+
+    fields.push("query = ?");
+    params.push(buildExactOrQuery(nextSearchTerms));
+    fields.push("exclude_terms = ?");
+    params.push(JSON.stringify({
+      searchTerms: nextSearchTerms,
+      mustIncludeTerms: nextMustIncludeTerms,
+      excludeTerms: nextExcludeTerms,
+    }));
   }
 
   if (!fields.length) {
@@ -623,8 +659,14 @@ async function runPoll(env, triggerType) {
         }
 
         for (const row of group.rows) {
-          const excludeTerms = safeJsonArray(row.exclude_terms).map((x) => String(x).toLowerCase());
-          if (isExcluded(article, excludeTerms)) {
+          const keywordConfig = row.keyword_config || parseKeywordConfig(row);
+          if (!matchesAnySearchTerm(article, keywordConfig.searchTerms)) {
+            continue;
+          }
+          if (!includesAllMustTerms(article, keywordConfig.mustIncludeTerms)) {
+            continue;
+          }
+          if (isExcluded(article, keywordConfig.excludeTerms)) {
             continue;
           }
 
@@ -735,11 +777,13 @@ async function runPoll(env, triggerType) {
 function groupKeywordRows(rows) {
   const map = new Map();
   for (const row of rows) {
-    const key = `${row.source}::${row.query}`;
+    const config = parseKeywordConfig(row);
+    const effectiveQuery = config.compiledQuery || row.query;
+    const key = `${row.source}::${effectiveQuery}`;
     if (!map.has(key)) {
-      map.set(key, { source: row.source, query: row.query, rows: [] });
+      map.set(key, { source: row.source, query: effectiveQuery, rows: [] });
     }
-    map.get(key).rows.push(row);
+    map.get(key).rows.push({ ...row, query: effectiveQuery, keyword_config: config });
   }
   return map;
 }
@@ -871,10 +915,43 @@ function normalizeUrl(input) {
   }
 }
 
+function buildArticleHaystack(article) {
+  return normalizeMatchText(`${article?.title || ""} ${article?.summary || ""}`);
+}
+
+function matchesAnySearchTerm(article, searchTerms) {
+  const terms = normalizeTermArray(searchTerms);
+  if (!terms.length) return true;
+  const haystack = buildArticleHaystack(article);
+  return terms.some((term) => containsExactTerm(haystack, term));
+}
+
+function includesAllMustTerms(article, mustIncludeTerms) {
+  const terms = normalizeTermArray(mustIncludeTerms);
+  if (!terms.length) return true;
+  const haystack = buildArticleHaystack(article);
+  return terms.every((term) => containsExactTerm(haystack, term));
+}
+
 function isExcluded(article, excludeTerms) {
-  if (!excludeTerms?.length) return false;
-  const haystack = `${article.title} ${article.summary}`.toLowerCase();
-  return excludeTerms.some((term) => term && haystack.includes(term));
+  const terms = normalizeTermArray(excludeTerms);
+  if (!terms.length) return false;
+  const haystack = buildArticleHaystack(article);
+  return terms.some((term) => containsExactTerm(haystack, term));
+}
+
+function containsExactTerm(normalizedHaystack, term) {
+  const needle = normalizeMatchText(term);
+  if (!needle) return false;
+  return normalizedHaystack.includes(needle);
+}
+
+function normalizeMatchText(value) {
+  return String(value || "")
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 async function buildArticleId(article, query) {
@@ -1035,12 +1112,105 @@ function getMaxKeywordsPerUser(env) {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_KEYWORDS_PER_USER;
 }
 
-function safeJsonArray(value) {
+function parseKeywordConfig(row) {
+  const compiledQueryRaw = collapseSpace(String(row?.query || ""));
+  const parsed = safeJson(row?.exclude_terms);
+
+  if (Array.isArray(parsed)) {
+    const searchTerms = normalizeSearchTermsInput(undefined, compiledQueryRaw);
+    return {
+      compiledQuery: compiledQueryRaw || buildExactOrQuery(searchTerms),
+      searchTerms,
+      mustIncludeTerms: [],
+      excludeTerms: normalizeTermArray(parsed),
+    };
+  }
+
+  if (parsed && typeof parsed === "object") {
+    const searchTerms = normalizeSearchTermsInput(parsed.searchTerms, compiledQueryRaw);
+    const resolvedSearchTerms = searchTerms.length
+      ? searchTerms
+      : normalizeSearchTermsInput(undefined, compiledQueryRaw);
+    const mustIncludeTerms = normalizeTermArray(parsed.mustIncludeTerms);
+    const excludeTerms = normalizeTermArray(parsed.excludeTerms);
+    return {
+      compiledQuery: buildExactOrQuery(resolvedSearchTerms) || compiledQueryRaw,
+      searchTerms: resolvedSearchTerms,
+      mustIncludeTerms,
+      excludeTerms,
+    };
+  }
+
+  const fallbackSearchTerms = normalizeSearchTermsInput(undefined, compiledQueryRaw);
+  return {
+    compiledQuery: compiledQueryRaw || buildExactOrQuery(fallbackSearchTerms),
+    searchTerms: fallbackSearchTerms,
+    mustIncludeTerms: [],
+    excludeTerms: [],
+  };
+}
+
+function normalizeSearchTermsInput(searchTerms, queryFallback) {
+  if (searchTerms !== undefined && searchTerms !== null) {
+    if (Array.isArray(searchTerms)) {
+      return normalizeTermArray(searchTerms);
+    }
+
+    const raw = String(searchTerms || "");
+    const quoted = [...raw.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+    if (quoted.length) {
+      return normalizeTermArray(quoted);
+    }
+
+    if (/\s+OR\s+/i.test(raw) && !/[,\n]/.test(raw)) {
+      return normalizeTermArray(raw.split(/\s+OR\s+/i));
+    }
+
+    return normalizeTermArray(raw);
+  }
+
+  const queryText = collapseSpace(String(queryFallback || ""));
+  if (!queryText) return [];
+
+  const quoted = [...queryText.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+  if (quoted.length) {
+    return normalizeTermArray(quoted);
+  }
+
+  return normalizeTermArray(queryText.split(/\s+OR\s+/i));
+}
+
+function normalizeTermArray(input) {
+  let parts = [];
+  if (Array.isArray(input)) {
+    parts = input;
+  } else if (input !== undefined && input !== null) {
+    parts = String(input).split(/[\n,]+/);
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const value of parts) {
+    const normalized = collapseSpace(String(value || "").replace(/"/g, ""));
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function buildExactOrQuery(searchTerms) {
+  const terms = normalizeTermArray(searchTerms);
+  return terms.map((term) => `"${term}"`).join(" OR ");
+}
+
+function safeJson(value) {
   try {
-    const parsed = JSON.parse(value || "[]");
-    return Array.isArray(parsed) ? parsed : [];
+    return JSON.parse(value || "null");
   } catch {
-    return [];
+    return null;
   }
 }
 

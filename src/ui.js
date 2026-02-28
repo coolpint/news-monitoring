@@ -22,6 +22,13 @@ function clientMain() {
       .replace(/'/g, "&#39;");
   }
 
+  function parseTermInput(value) {
+    return String(value || "")
+      .split(/[\n,]+/)
+      .map((term) => term.trim())
+      .filter(Boolean);
+  }
+
   async function api(path, options = {}) {
     const init = { ...options };
     init.headers = { "Content-Type": "application/json", ...(options.headers || {}) };
@@ -126,7 +133,8 @@ function clientMain() {
     const keywordRows = state.keywords.map((k) => `
       <tr>
         <td>${esc(k.label)}</td>
-        <td>${esc(k.query)}</td>
+        <td>${(k.search_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
+        <td>${(k.must_include_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${(k.exclude_terms || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(" ") || "-"}</td>
         <td>${k.active ? "ON" : "OFF"}</td>
         <td>
@@ -195,14 +203,16 @@ function clientMain() {
       <div class="split">
         <section class="card">
           <h2>키워드</h2>
+          <div class="muted" style="margin-bottom:10px;">검색어는 정확 일치로 처리되며 여러 개 입력 시 OR 조건으로 동작합니다.</div>
           <table>
-            <thead><tr><th>라벨</th><th>쿼리</th><th>제외어</th><th>상태</th><th>관리</th></tr></thead>
-            <tbody>${keywordRows || "<tr><td colspan='5' class='muted'>아직 키워드가 없습니다.</td></tr>"}</tbody>
+            <thead><tr><th>라벨</th><th>검색어(OR)</th><th>꼭 포함</th><th>제외</th><th>상태</th><th>관리</th></tr></thead>
+            <tbody>${keywordRows || "<tr><td colspan='6' class='muted'>아직 키워드가 없습니다.</td></tr>"}</tbody>
           </table>
           <div class="row inline" style="margin-top:10px;">
             <div><label>라벨</label><input id="kwLabel" placeholder="예: 경쟁사A" /></div>
-            <div><label>검색어</label><input id="kwQuery" placeholder="예: 회사명 OR 브랜드명" /></div>
-            <div><label>제외어(쉼표)</label><input id="kwExclude" placeholder="채용, 공고" /></div>
+            <div><label>검색어(쉼표/줄바꿈)</label><input id="kwSearchTerms" placeholder="예: 회사명, 브랜드명" /></div>
+            <div><label>꼭 포함(쉼표/줄바꿈)</label><input id="kwMustInclude" placeholder="예: 투자유치, 신제품" /></div>
+            <div><label>제외어(쉼표/줄바꿈)</label><input id="kwExclude" placeholder="예: 채용, 공고" /></div>
           </div>
           <div class="btns"><button id="addKeywordBtn">키워드 추가</button></div>
         </section>
@@ -339,11 +349,9 @@ function clientMain() {
             method: "POST",
             body: {
               label: document.getElementById("kwLabel").value,
-              query: document.getElementById("kwQuery").value,
-              excludeTerms: document.getElementById("kwExclude").value
-                .split(",")
-                .map((x) => x.trim())
-                .filter(Boolean),
+              searchTerms: parseTermInput(document.getElementById("kwSearchTerms").value),
+              mustIncludeTerms: parseTermInput(document.getElementById("kwMustInclude").value),
+              excludeTerms: parseTermInput(document.getElementById("kwExclude").value),
             },
           });
           setNotice("키워드를 추가했습니다.");
