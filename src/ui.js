@@ -248,11 +248,25 @@ function clientMain() {
         </tr>
       `).join("");
 
-    const mediaSourceRows = (state.mediaSources || []).map((item) => `
+    const mediaSourceRows = (state.mediaSources || []).map((item) => {
+      const tier = Number(item.tier || 4);
+      const tierOptions = [1, 2, 3, 4]
+        .map((value) => `<option value="${value}" ${tier === value ? "selected" : ""}>T${value}</option>`)
+        .join("");
+      return `
       <tr>
-        <td>${esc(item.name || "-")}</td>
-        <td>${esc(item.domain || "-")}</td>
-        <td>T${Number(item.tier || 4)}</td>
+        <td>${isAdmin
+          ? `<input class="media-edit" data-media-name-id="${item.id}" data-original-name="${esc(item.name || "")}" value="${esc(item.name || "")}" />`
+          : esc(item.name || "-")}</td>
+        <td>
+          <div class="media-domain">${esc(item.domain || "-")}</div>
+          ${isAdmin
+            ? `<input class="media-edit" data-media-site-url-id="${item.id}" data-original-site-url="${esc(item.site_url || "")}" value="${esc(item.site_url || "")}" placeholder="https://example.com" />`
+            : ""}
+        </td>
+        <td>${isAdmin
+          ? `<select class="media-edit" data-media-tier-id="${item.id}" data-original-tier="${tier}">${tierOptions}</select>`
+          : `T${tier}`}</td>
         <td>${item.rss_supported ? "RSS" : "-"}</td>
         <td>${item.naver_supported ? "Naver" : "-"}</td>
         <td>${esc(item.probe_status || "-")}</td>
@@ -260,14 +274,15 @@ function clientMain() {
         <td>${item.active ? "ON" : "OFF"}</td>
         ${isAdmin ? `<td>
           <div class="btns">
+            <button class="ghost" data-action="media-save" data-id="${item.id}">저장</button>
             <button class="ghost" data-action="media-reprobe" data-id="${item.id}">재검사</button>
-            <button class="ghost" data-action="media-set-tier" data-id="${item.id}" data-tier="${Number(item.tier || 4)}">티어변경</button>
             <button class="ghost" data-action="media-toggle" data-id="${item.id}" data-active="${item.active ? 1 : 0}">${item.active ? "중지" : "활성화"}</button>
             <button class="warn" data-action="media-delete" data-id="${item.id}">삭제</button>
           </div>
         </td>` : ""}
       </tr>
-    `).join("");
+    `;
+    }).join("");
 
     const channelRows = state.channels.map((c) => `
       <tr>
@@ -378,7 +393,7 @@ function clientMain() {
         </div>` : `<div class="muted" style="margin-bottom:10px;">매체 추가/수정은 관리자만 가능합니다.</div>`}
 
         <table>
-          <thead><tr><th>이름</th><th>도메인</th><th>티어</th><th>RSS</th><th>Naver</th><th>상태</th><th>결과</th><th>활성</th>${isAdmin ? "<th>관리</th>" : ""}</tr></thead>
+          <thead><tr><th>이름</th><th>도메인 / URL</th><th>티어</th><th>RSS</th><th>Naver</th><th>상태</th><th>결과</th><th>활성</th>${isAdmin ? "<th>관리</th>" : ""}</tr></thead>
           <tbody>${mediaSourceRows || `<tr><td colspan='${isAdmin ? "9" : "8"}' class='muted'>등록된 매체가 없습니다.</td></tr>`}</tbody>
         </table>
 
@@ -720,16 +735,35 @@ function clientMain() {
       });
     });
 
-    app.querySelectorAll("button[data-action='media-set-tier']").forEach((el) => {
+    app.querySelectorAll("button[data-action='media-save']").forEach((el) => {
       el.addEventListener("click", async () => {
-        const nextTier = window.prompt("티어를 입력하세요 (1~4)", el.dataset.tier || "4");
-        if (nextTier === null) return;
+        const id = String(el.dataset.id || "");
+        const nameEl = app.querySelector(`input[data-media-name-id="${id}"]`);
+        const siteUrlEl = app.querySelector(`input[data-media-site-url-id="${id}"]`);
+        const tierEl = app.querySelector(`select[data-media-tier-id="${id}"]`);
+        const name = nameEl ? nameEl.value.trim() : "";
+        const siteUrl = siteUrlEl ? siteUrlEl.value.trim() : "";
+        const tier = Number(tierEl ? tierEl.value : 4);
+        const originalName = nameEl ? String(nameEl.dataset.originalName || "").trim() : "";
+        const originalSiteUrl = siteUrlEl ? String(siteUrlEl.dataset.originalSiteUrl || "").trim() : "";
+        const originalTier = Number(tierEl ? tierEl.dataset.originalTier : 4);
+        const patch = {};
+
+        if (name && name !== originalName) patch.name = name;
+        if (siteUrl && siteUrl !== originalSiteUrl) patch.siteUrl = siteUrl;
+        if (tier !== originalTier) patch.tier = tier;
+
+        if (!Object.keys(patch).length) {
+          setNotice("변경된 값이 없습니다.");
+          return;
+        }
+
         try {
-          await api("/api/media-sources/" + el.dataset.id, {
+          await api("/api/media-sources/" + id, {
             method: "PATCH",
-            body: { tier: Number(nextTier) },
+            body: patch,
           });
-          setNotice("매체 티어를 변경했습니다.");
+          setNotice("매체 정보를 저장했습니다.");
           await loadData();
           render();
         } catch (err) {
@@ -991,6 +1025,17 @@ export function renderAppShell() {
       .media-head input {
         max-width: 320px;
       }
+      .media-edit {
+        padding: 6px 8px;
+        border-radius: 8px;
+        font-size: 0.82rem;
+        min-width: 120px;
+      }
+      .media-domain {
+        font-size: 0.82rem;
+        color: var(--ink);
+        margin-bottom: 4px;
+      }
       .tier-grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -1054,7 +1099,7 @@ export function renderAppShell() {
         <div class="status"><span class="dot"></span><span id="modeLabel">loading...</span></div>
       </header>
       <main id="app"></main>
-      <div class="footer">5분 크론 기준으로 새 기사 감지 후 Teams/Slack 웹훅으로 전송됩니다.</div>
+      <div class="footer">5분 크론 기준으로 새 기사 감지 후 Teams/Slack/Telegram 채널로 전송됩니다.</div>
     </div>
     <script>
       // Wrangler/esbuild may inject helper wrappers like __name into function source.
