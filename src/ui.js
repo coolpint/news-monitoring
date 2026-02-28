@@ -645,7 +645,12 @@ export function renderAppShell() {
       <main id="app"></main>
       <div class="footer">5분 크론 기준으로 새 기사 감지 후 Teams/Slack 웹훅으로 전송됩니다.</div>
     </div>
-    <script>(${clientMain.toString()})();</script>
+    <script>
+      // Wrangler/esbuild may inject helper wrappers like __name into function source.
+      // Define a no-op helper so inline toString() code runs in browsers consistently.
+      const __name = (target) => target;
+      (${clientMain.toString()})();
+    </script>
   </body>
 </html>`;
 }

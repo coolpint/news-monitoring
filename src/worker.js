@@ -34,6 +34,10 @@ async function handleRequest(request, env) {
     });
   }
 
+  if (path === "/favicon.ico") {
+    return new Response(null, { status: 204 });
+  }
+
   if (path === "/api/bootstrap-status" && method === "GET") {
     const countRow = await env.DB.prepare("SELECT COUNT(*) AS count FROM users").first();
     return jsonResponse({
