@@ -740,7 +740,7 @@ function clientMain() {
           const res = await api("/api/keywords/" + el.dataset.id + "/diagnose");
           const m = res.metrics || {};
           setNotice(
-            `진단 결과 - Google:${m.fetched_google_rss || 0}, CustomRSS:${m.fetched_custom_rss || 0}, 최종통과:${m.final_passed || 0}, 활성채널:${m.channels_active || 0}, 신규알림가능:${m.potential_new_notifications || 0}`,
+            `진단 결과 - Google:${m.fetched_google_rss || 0}, CustomRSS:${m.fetched_custom_rss || 0}, Naver:${m.naver_count || 0}, 신선통과:${m.fresh_kept || 0}, 과거제외:${m.stale_dropped || 0}, 최종통과:${m.final_passed || 0}, 활성채널:${m.channels_active || 0}, 신규알림가능:${m.potential_new_notifications || 0}`,
             false,
           );
           console.log("keyword diagnose", res);

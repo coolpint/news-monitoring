@@ -16,16 +16,22 @@
 - 전역 알림 채널(Teams/Slack/Telegram) 관리
 - 5분 크론 수집(`*/5 * * * *`)
 - 중복 기사 방지(해시 키 기반)
+- 24시간 신선도 필터(기본 24h, `published_at` 없으면 유연 허용)
+- Google RSS 팬아웃 수집(검색어 단일 + OR 보강)
+- Naver API fallback(일 1000회/런당 4회 기본 캡)
+- 실행 락 + stale run 자동 정리(중첩 실행 방지)
 - 수동 실행 버튼 + 실행 이력 확인
 - 운영 제한값(`MAX_USERS`, `MAX_KEYWORDS_PER_USER`)으로 무료 티어 보호
 
 ## 아키텍처
 
 1. `scheduled` 이벤트(5분) 또는 수동 실행 호출
-2. 활성 키워드 쿼리별 RSS 수집(`google_rss`)
-3. 기사 중복 제거 후 `notifications` 큐 적재
-4. 채널별로 묶어 Teams/Slack/Telegram 발송
-5. 결과를 `poll_runs`에 저장
+2. `poll` 락 획득 + stale `running` 정리
+3. 활성 키워드별 Google RSS 팬아웃 수집 + 커스텀 RSS 수집
+4. Google fresh hit 부족 시 Naver fallback 보강(Stage A), unavailable 매체 `site:` 보강(Stage B)
+5. 24시간 필터 적용 후 기사/알림 큐 적재
+6. 채널별로 묶어 Teams/Slack/Telegram 발송
+7. 결과를 `poll_runs`에 저장
 
 ## 키워드 검색 규칙
 
@@ -72,7 +78,11 @@ npx wrangler d1 execute news_monitoring --remote --file=./sql/schema.sql
 
 ```bash
 npx wrangler secret put SESSION_SECRET
+npx wrangler secret put NAVER_CLIENT_ID
+npx wrangler secret put NAVER_CLIENT_SECRET
 ```
+
+`NAVER_CLIENT_ID/SECRET`은 Naver Open API fallback을 사용할 때만 필요합니다. 미설정 시 Google+RSS만 동작합니다.
 
 ### 5) 배포
 
@@ -110,7 +120,23 @@ APP_MODE = "multi_user_teams" # 또는 single_user_slack
 MAX_USERS = "30"
 MAX_KEYWORDS_PER_USER = "40"
 MAX_CUSTOM_RSS_SOURCES_PER_RUN = "20"
+NEWS_MAX_AGE_HOURS = "24"
+GOOGLE_FETCH_TIMEOUT_MS = "8000"
+GOOGLE_FETCH_CONCURRENCY = "4"
+NAVER_DAILY_LIMIT = "1000"
+NAVER_PER_RUN_LIMIT = "4"
+RUN_LOCK_TTL_SECONDS = "270"
+RUN_STALE_TIMEOUT_MINUTES = "15"
 ```
+
+## 운영 점검 API
+
+- `GET /api/keywords/:id/diagnose`
+  - freshness 지표(`fresh_kept`, `stale_dropped`, `missing_published_kept`)
+  - source 지표(`google_count`, `custom_rss_count`, `naver_count`)
+  - Naver 예산 지표(`naver_used_today`, `naver_remaining_today`)
+- `GET /api/source-health` (admin)
+  - Naver 일일 예산/잔량, poll lock 상태, stale running count 요약
 
 ### multi_user_teams
 

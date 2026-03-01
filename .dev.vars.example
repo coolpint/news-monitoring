@@ -1,1 +1,3 @@
 SESSION_SECRET=replace-with-long-random-secret
+NAVER_CLIENT_ID=replace-with-naver-client-id
+NAVER_CLIENT_SECRET=replace-with-naver-client-secret

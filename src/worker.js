@@ -5,6 +5,8 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14;
 const DEFAULT_MAX_USERS = 30;
 const DEFAULT_MAX_KEYWORDS_PER_USER = 40;
 const ALL_TIER_VALUES = [1, 2, 3, 4];
+const NAVER_USAGE_SOURCE = "naver_news";
+const POLL_LOCK_NAME = "poll";
 
 const MEDIA_TIER_NAMES = {
   1: [
@@ -142,6 +144,10 @@ async function handleRequest(request, env) {
 
   if (path === "/api/poll-runs" && method === "GET") {
     return listPollRuns(env, session.user);
+  }
+
+  if (path === "/api/source-health" && method === "GET") {
+    return getSourceHealth(env, session.user);
   }
 
   if (path === "/api/media-catalog" && method === "GET") {
@@ -475,13 +481,19 @@ async function diagnoseKeyword(env, user, keywordId) {
   }
 
   await ensureMediaSourcesTable(env.DB);
+  await ensureRuntimeTables(env.DB);
   const tierLookup = await loadMediaTierLookup(env.DB);
   const keywordConfig = parseKeywordConfig(row);
+  const freshnessCutoffIso = getFreshnessCutoffIso(env);
+  const freshnessStats = createFreshnessStats();
 
-  const [rssArticles, customRssArticles] = await Promise.all([
-    fetchArticlesForQuery(env, row.source, keywordConfig.compiledQuery),
+  const [googleResult, customRssRaw, naverBudget] = await Promise.all([
+    fetchArticlesForQuery(env, row.source, keywordConfig.compiledQuery, { searchTerms: keywordConfig.searchTerms }),
     fetchManagedRssArticles(env, env.DB),
+    initNaverBudgetState(env, env.DB),
   ]);
+  const rssArticles = applyFreshnessFilter(googleResult.articles, freshnessCutoffIso, freshnessStats);
+  const customRssArticles = applyFreshnessFilter(customRssRaw, freshnessCutoffIso, freshnessStats);
 
   const merged = dedupeArticlesByUrl([...rssArticles, ...customRssArticles]).slice(0, 200);
   let tierPassed = 0;
@@ -590,11 +602,18 @@ async function diagnoseKeyword(env, user, keywordId) {
       mustIncludeTerms: keywordConfig.mustIncludeTerms,
       excludeTerms: keywordConfig.excludeTerms,
       tierFilters: keywordConfig.tierFilters,
+      freshness_cutoff_iso: freshnessCutoffIso,
     },
     metrics: {
       fetched_google_rss: rssArticles.length,
       fetched_custom_rss: customRssArticles.length,
+      google_count: rssArticles.length,
+      custom_rss_count: customRssArticles.length,
+      naver_count: 0,
       merged_after_dedupe: merged.length,
+      fresh_kept: freshnessStats.fresh_kept,
+      stale_dropped: freshnessStats.stale_dropped,
+      missing_published_kept: freshnessStats.missing_published_kept,
       tier_passed: tierPassed,
       search_passed: searchPassed,
       must_include_passed: mustPassed,
@@ -604,6 +623,10 @@ async function diagnoseKeyword(env, user, keywordId) {
       channels_inactive: Math.max(0, channels.length - activeChannelIds.length),
       potential_new_articles: potentialNewArticles,
       potential_new_notifications: potentialNewNotifications,
+      naver_used_today: naverBudget.usedToday,
+      naver_remaining_today: naverBudget.remainingToday,
+      naver_per_run_limit: naverBudget.perRunLimit,
+      naver_daily_limit: naverBudget.dailyLimit,
     },
     channels,
     samples,
@@ -801,6 +824,57 @@ async function listPollRuns(env, user) {
   ).all();
 
   return jsonResponse({ runs: res.results || [] });
+}
+
+async function getSourceHealth(env, user) {
+  if (user.role !== "admin") {
+    return jsonResponse({ error: "Admin only" }, 403);
+  }
+
+  await ensureRuntimeTables(env.DB);
+  const staleTimeoutMinutes = getRunStaleTimeoutMinutes(env);
+  const staleModifier = `-${staleTimeoutMinutes} minutes`;
+  const staleRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS count
+     FROM poll_runs
+     WHERE status = 'running'
+       AND datetime(started_at) < datetime('now', ?)`,
+  )
+    .bind(staleModifier)
+    .first();
+
+  const lockRow = await env.DB.prepare(
+    `SELECT name, owner_run_id, acquired_at, expires_at
+     FROM job_locks
+     WHERE name = ?
+     LIMIT 1`,
+  )
+    .bind(POLL_LOCK_NAME)
+    .first();
+  const day = getSeoulDayKey();
+  const naverUsedToday = await getApiUsageDaily(env.DB, day, NAVER_USAGE_SOURCE);
+  const naverDailyLimit = getNaverDailyLimit(env);
+  const naverPerRunLimit = getNaverPerRunLimit(env);
+
+  return jsonResponse({
+    day,
+    naver: {
+      enabled: Boolean(String(env.NAVER_CLIENT_ID || "").trim() && String(env.NAVER_CLIENT_SECRET || "").trim()),
+      used_today: naverUsedToday,
+      remaining_today: Math.max(0, naverDailyLimit - naverUsedToday),
+      daily_limit: naverDailyLimit,
+      per_run_limit: naverPerRunLimit,
+    },
+    lock: {
+      name: POLL_LOCK_NAME,
+      active: Boolean(lockRow && Date.parse(lockRow.expires_at || "") > Date.now()),
+      owner_run_id: lockRow?.owner_run_id || null,
+      acquired_at: lockRow?.acquired_at || null,
+      expires_at: lockRow?.expires_at || null,
+    },
+    stale_running_count: Number(staleRow?.count || 0),
+    stale_timeout_minutes: staleTimeoutMinutes,
+  });
 }
 
 async function listMediaCatalog(env) {
@@ -1044,24 +1118,60 @@ async function runPoll(env, triggerType) {
   const db = env.DB;
   await ensureArticlePublisherColumns(db);
   await ensureMediaSourcesTable(db);
+  await ensureRuntimeTables(db);
   const tierLookup = await loadMediaTierLookup(db);
   const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
+  const freshnessCutoffIso = getFreshnessCutoffIso(env);
+  const freshnessStats = createFreshnessStats();
+  const sourceStats = {
+    google_count: 0,
+    custom_rss_count: 0,
+    naver_count: 0,
+  };
+  const staleCleanedRuns = await cleanupStaleRuns(db, getRunStaleTimeoutMinutes(env));
+  const lockAcquired = await acquireJobLock(db, POLL_LOCK_NAME, runId, getRunLockTtlSeconds(env));
 
-  await db.prepare(
-    `INSERT INTO poll_runs (id, trigger_type, started_at, status)
-     VALUES (?, ?, ?, 'running')`,
-  )
-    .bind(runId, triggerType, startedAt)
-    .run();
+  if (!lockAcquired) {
+    await db.prepare(
+      `INSERT INTO poll_runs (id, trigger_type, started_at, finished_at, status, error_message)
+       VALUES (?, ?, ?, ?, 'skipped_locked', ?)`,
+    )
+      .bind(runId, triggerType, startedAt, new Date().toISOString(), "skipped: active poll lock")
+      .run();
+
+    return {
+      runId,
+      triggerType,
+      status: "skipped_locked",
+      fetchedCount: 0,
+      newArticleCount: 0,
+      queuedNotifications: 0,
+      sentNotifications: 0,
+      failedNotifications: 0,
+      lock_acquired: false,
+      skipped_locked: 1,
+      stale_cleaned_runs: staleCleanedRuns,
+    };
+  }
 
   let fetchedCount = 0;
   let newArticleCount = 0;
   let queuedNotifications = 0;
   let sentNotifications = 0;
   let failedNotifications = 0;
+  let naverUsedToday = 0;
+  let naverRemainingToday = 0;
+  let naverUsedThisRun = 0;
 
   try {
+    await db.prepare(
+      `INSERT INTO poll_runs (id, trigger_type, started_at, status)
+       VALUES (?, ?, ?, 'running')`,
+    )
+      .bind(runId, triggerType, startedAt)
+      .run();
+
     const keywordRows = await db.prepare(
       `SELECT k.id AS keyword_id, k.user_id, k.label, k.query, k.exclude_terms, k.source,
               c.id AS channel_id, c.type, c.webhook_url, c.name AS channel_name,
@@ -1075,13 +1185,74 @@ async function runPoll(env, triggerType) {
 
     const rows = keywordRows.results || [];
     const groupedByQuery = groupKeywordRows(rows);
-    const customRssArticles = await fetchManagedRssArticles(env, db);
-    fetchedCount += customRssArticles.length;
+    const customRssRaw = await fetchManagedRssArticles(env, db);
+    sourceStats.custom_rss_count += customRssRaw.length;
+    fetchedCount += customRssRaw.length;
+    const customRssArticles = applyFreshnessFilter(customRssRaw, freshnessCutoffIso, freshnessStats);
 
-    for (const group of groupedByQuery.values()) {
-      const articles = await fetchArticlesForQuery(env, group.source, group.query);
-      fetchedCount += articles.length;
-      const mergedArticles = dedupeArticlesByUrl([...articles, ...customRssArticles]);
+    const naverBudget = await initNaverBudgetState(env, db);
+    naverUsedToday = naverBudget.usedToday;
+    naverRemainingToday = naverBudget.remainingToday;
+
+    const groupResults = new Map();
+    for (const [groupKey, group] of groupedByQuery.entries()) {
+      const googleResult = await fetchArticlesForQuery(env, group.source, group.query, { searchTerms: group.searchTerms });
+      sourceStats.google_count += googleResult.google_count;
+      fetchedCount += googleResult.google_count;
+      const googleFreshArticles = applyFreshnessFilter(googleResult.articles, freshnessCutoffIso, freshnessStats);
+      groupResults.set(groupKey, {
+        googleFreshArticles,
+        stageANaverArticles: [],
+      });
+    }
+
+    const stageACandidates = [...groupedByQuery.entries()]
+      .map(([groupKey, group]) => {
+        const groupResult = groupResults.get(groupKey) || { googleFreshArticles: [] };
+        return {
+          groupKey,
+          group,
+          googleFreshCount: (groupResult.googleFreshArticles || []).length,
+        };
+      })
+      .filter((x) => x.googleFreshCount < 2)
+      .sort((a, b) => a.googleFreshCount - b.googleFreshCount);
+
+    for (const candidate of stageACandidates) {
+      if (!await reserveNaverCall(db, naverBudget)) {
+        break;
+      }
+
+      const query = buildNaverFallbackQuery(candidate.group);
+      const naverResult = await fetchNaverArticles(env, query);
+      naverUsedThisRun += 1;
+      naverUsedToday = naverBudget.usedToday;
+      naverRemainingToday = naverBudget.remainingToday;
+      sourceStats.naver_count += naverResult.articles.length;
+      fetchedCount += naverResult.articles.length;
+
+      const freshNaver = applyFreshnessFilter(naverResult.articles, freshnessCutoffIso, freshnessStats);
+      const existing = groupResults.get(candidate.groupKey) || { googleFreshArticles: [], stageANaverArticles: [] };
+      existing.stageANaverArticles = dedupeArticlesByUrl([...(existing.stageANaverArticles || []), ...freshNaver]).slice(0, 120);
+      groupResults.set(candidate.groupKey, existing);
+    }
+
+    const stageBResult = await fetchNaverUnavailableDomains(env, db, naverBudget);
+    naverUsedThisRun += stageBResult.usedCalls;
+    naverUsedToday = naverBudget.usedToday;
+    naverRemainingToday = naverBudget.remainingToday;
+    sourceStats.naver_count += stageBResult.articles.length;
+    fetchedCount += stageBResult.articles.length;
+    const stageBFreshArticles = applyFreshnessFilter(stageBResult.articles, freshnessCutoffIso, freshnessStats);
+
+    for (const [groupKey, group] of groupedByQuery.entries()) {
+      const groupResult = groupResults.get(groupKey) || { googleFreshArticles: [], stageANaverArticles: [] };
+      const mergedArticles = dedupeArticlesByUrl([
+        ...(groupResult.googleFreshArticles || []),
+        ...customRssArticles,
+        ...(groupResult.stageANaverArticles || []),
+        ...stageBFreshArticles,
+      ]);
 
       for (const article of mergedArticles) {
         const matchedRows = [];
@@ -1166,8 +1337,11 @@ async function runPoll(env, triggerType) {
        JOIN channels c ON c.id = n.channel_id
        JOIN users u ON u.id = n.user_id
        WHERE n.status = 'pending'
+         AND datetime(COALESCE(a.published_at, a.first_seen_at)) >= datetime(?)
        ORDER BY n.created_at ASC`,
-    ).all();
+    )
+      .bind(freshnessCutoffIso)
+      .all();
 
     const pendingWithPath = (pendingRows.results || []).map((row) => {
       const config = parseKeywordConfig({ query: row.query, exclude_terms: row.exclude_terms });
@@ -1219,11 +1393,24 @@ async function runPoll(env, triggerType) {
     return {
       runId,
       triggerType,
+      status: "success",
       fetchedCount,
       newArticleCount,
       queuedNotifications,
       sentNotifications,
       failedNotifications,
+      lock_acquired: true,
+      skipped_locked: 0,
+      stale_cleaned_runs: staleCleanedRuns,
+      fresh_kept: freshnessStats.fresh_kept,
+      stale_dropped: freshnessStats.stale_dropped,
+      missing_published_kept: freshnessStats.missing_published_kept,
+      google_count: sourceStats.google_count,
+      custom_rss_count: sourceStats.custom_rss_count,
+      naver_count: sourceStats.naver_count,
+      naver_used_today: naverUsedToday,
+      naver_remaining_today: naverRemainingToday,
+      naver_used_this_run: naverUsedThisRun,
     };
   } catch (error) {
     const message = String(error?.message || error);
@@ -1247,6 +1434,8 @@ async function runPoll(env, triggerType) {
 
     console.error("poll failed", error);
     throw error;
+  } finally {
+    await releaseJobLock(db, POLL_LOCK_NAME, runId);
   }
 }
 
@@ -1257,9 +1446,11 @@ function groupKeywordRows(rows) {
     const effectiveQuery = config.compiledQuery || row.query;
     const key = `${row.source}::${effectiveQuery}`;
     if (!map.has(key)) {
-      map.set(key, { source: row.source, query: effectiveQuery, rows: [] });
+      map.set(key, { key, source: row.source, query: effectiveQuery, rows: [], searchTerms: [] });
     }
-    map.get(key).rows.push({ ...row, query: effectiveQuery, keyword_config: config });
+    const grouped = map.get(key);
+    grouped.rows.push({ ...row, query: effectiveQuery, keyword_config: config });
+    grouped.searchTerms = mergeUniqueTerms(grouped.searchTerms, config.searchTerms);
   }
   return map;
 }
@@ -1283,33 +1474,317 @@ function chunkRows(rows, size) {
   return chunks;
 }
 
-async function fetchArticlesForQuery(env, source, query) {
+async function fetchArticlesForQuery(env, source, query, options = {}) {
   if (source !== "google_rss") {
-    return [];
+    return { articles: [], google_count: 0 };
   }
 
+  const googleResult = await fetchGoogleRssFanout(env, query, options.searchTerms || []);
+  return {
+    articles: googleResult.articles,
+    google_count: googleResult.articles.length,
+  };
+}
+
+async function fetchGoogleRssFanout(env, baseQuery, searchTerms) {
   const lang = (env.GOOGLE_NEWS_LANG || "ko").trim();
   const region = (env.GOOGLE_NEWS_REGION || "KR").trim();
   const edition = (env.GOOGLE_NEWS_EDITION || "KR:ko").trim();
-  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=${encodeURIComponent(lang)}&gl=${encodeURIComponent(region)}&ceid=${encodeURIComponent(edition)}`;
+  const queries = buildGoogleFanoutQueries(baseQuery, searchTerms);
+  if (!queries.length) {
+    return { articles: [] };
+  }
 
+  const timeoutMs = getGoogleFetchTimeoutMs(env);
+  const concurrency = getGoogleFetchConcurrency(env);
+  const jobs = queries.map((query) => async () => {
+    const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=${encodeURIComponent(lang)}&gl=${encodeURIComponent(region)}&ceid=${encodeURIComponent(edition)}`;
+    return fetchGoogleRssSingleQuery(url, query, timeoutMs);
+  });
+  const settled = await runWithConcurrency(jobs, concurrency);
+  const merged = dedupeArticlesByUrl(settled.flat()).slice(0, 240);
+  return { articles: merged };
+}
+
+function buildGoogleFanoutQueries(baseQuery, searchTerms) {
+  const out = [];
+  const seen = new Set();
+
+  const addQuery = (value) => {
+    const normalized = ensureGoogleWhenWindow(collapseSpace(String(value || "")));
+    if (!normalized) return;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(normalized);
+  };
+
+  addQuery(baseQuery);
+  const terms = normalizeTermArray(searchTerms).slice(0, 12);
+  for (const term of terms) {
+    addQuery(`"${term}"`);
+  }
+  if (terms.length > 1) {
+    addQuery(`(${terms.map((term) => `"${term}"`).join(" OR ")})`);
+  }
+  return out;
+}
+
+function ensureGoogleWhenWindow(query) {
+  const normalized = collapseSpace(String(query || ""));
+  if (!normalized) return "";
+  if (/\bwhen:\S+/i.test(normalized)) {
+    return normalized;
+  }
+  return `${normalized} when:1d`;
+}
+
+async function fetchGoogleRssSingleQuery(url, query, timeoutMs) {
   try {
-    const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
+    const res = await fetchWithTimeout(url, {
+      cf: { cacheTtl: 0, cacheEverything: false },
+    }, timeoutMs);
     if (!res.ok) {
       console.warn("google_rss fetch failed", { status: res.status, query });
       return [];
     }
 
     const xml = await res.text();
-    const parsed = parseRssItems(xml)
+    return parseRssItems(xml)
       .filter((item) => item.title && item.url)
       .slice(0, 20);
-
-    return parsed;
   } catch (error) {
-    console.warn("google_rss fetch error", { query, error: String(error?.message || error) });
+    const message = String(error?.message || error);
+    console.warn("google_rss fetch error", { query, error: message });
     return [];
   }
+}
+
+function createFreshnessStats() {
+  return {
+    fresh_kept: 0,
+    stale_dropped: 0,
+    missing_published_kept: 0,
+  };
+}
+
+function applyFreshnessFilter(articles, cutoffIso, stats) {
+  const cutoffMs = Date.parse(cutoffIso);
+  const out = [];
+  for (const article of articles || []) {
+    const published = article?.publishedAt ? Date.parse(article.publishedAt) : NaN;
+    if (Number.isFinite(published)) {
+      if (published >= cutoffMs) {
+        out.push(article);
+        if (stats) stats.fresh_kept += 1;
+      } else if (stats) {
+        stats.stale_dropped += 1;
+      }
+      continue;
+    }
+
+    out.push(article);
+    if (stats) stats.missing_published_kept += 1;
+  }
+  return out;
+}
+
+function mergeUniqueTerms(baseTerms, incomingTerms) {
+  const merged = normalizeTermArray(baseTerms);
+  for (const term of normalizeTermArray(incomingTerms)) {
+    const exists = merged.some((value) => value.toLowerCase() === term.toLowerCase());
+    if (!exists) merged.push(term);
+  }
+  return merged;
+}
+
+function buildNaverFallbackQuery(group) {
+  const queryFromTerms = normalizeTermArray(group?.searchTerms).slice(0, 4);
+  if (queryFromTerms.length) {
+    return queryFromTerms.map((term) => `"${term}"`).join(" OR ");
+  }
+
+  const cleaned = collapseSpace(String(group?.query || "").replace(/\bwhen:\S+/gi, ""));
+  return cleaned || String(group?.query || "");
+}
+
+async function fetchNaverUnavailableDomains(env, db, budgetState) {
+  if (!budgetState.enabled || budgetState.runRemaining <= 0 || budgetState.remainingToday <= 0) {
+    return { usedCalls: 0, articles: [] };
+  }
+
+  await ensureMediaSourcesTable(db);
+  const domainRes = await db.prepare(
+    `SELECT domain
+     FROM media_sources
+     WHERE active = 1
+       AND probe_status = 'unavailable'
+       AND domain IS NOT NULL
+       AND trim(domain) <> ''
+     ORDER BY domain ASC`,
+  ).all();
+  const domains = (domainRes.results || [])
+    .map((row) => normalizeDomain(row.domain))
+    .filter(Boolean);
+  if (!domains.length) {
+    return { usedCalls: 0, articles: [] };
+  }
+
+  const cursorRaw = await getAppState(db, "naver_unavailable_cursor");
+  const startIndex = domains.length ? Number(cursorRaw || 0) % domains.length : 0;
+  let offset = 0;
+  let usedCalls = 0;
+  const collected = [];
+
+  while (offset < domains.length) {
+    if (!await reserveNaverCall(db, budgetState)) {
+      break;
+    }
+    const domain = domains[(startIndex + offset) % domains.length];
+    const query = `site:${domain}`;
+    const result = await fetchNaverArticles(env, query);
+    usedCalls += 1;
+    collected.push(...result.articles);
+    offset += 1;
+  }
+
+  if (domains.length) {
+    const nextCursor = (startIndex + offset) % domains.length;
+    await setAppState(db, "naver_unavailable_cursor", String(nextCursor));
+  }
+
+  return {
+    usedCalls,
+    articles: dedupeArticlesByUrl(collected).slice(0, 240),
+  };
+}
+
+async function fetchNaverArticles(env, query) {
+  const clientId = String(env.NAVER_CLIENT_ID || "").trim();
+  const clientSecret = String(env.NAVER_CLIENT_SECRET || "").trim();
+  if (!clientId || !clientSecret) {
+    return { articles: [] };
+  }
+
+  const endpoint = `https://openapi.naver.com/v1/search/news.json?query=${encodeURIComponent(query)}&display=20&start=1&sort=date`;
+  try {
+    const res = await fetch(endpoint, {
+      headers: {
+        "X-Naver-Client-Id": clientId,
+        "X-Naver-Client-Secret": clientSecret,
+      },
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.warn("naver api fetch failed", { status: res.status, query, body: body.slice(0, 240) });
+      return { articles: [] };
+    }
+
+    const data = await res.json();
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const parsed = items.map((item) => {
+      const originalUrl = String(item.originallink || item.link || "").trim();
+      const articleUrl = normalizeUrl(originalUrl);
+      return {
+        title: collapseSpace(stripHtml(decodeEntities(String(item.title || "")))),
+        url: articleUrl,
+        normalizedUrl: normalizeUrl(articleUrl),
+        summary: collapseSpace(stripHtml(decodeEntities(String(item.description || "")))).slice(0, 500),
+        publishedAt: toIsoDate(item.pubDate),
+        publisherName: "",
+        publisherDomain: normalizeDomain(extractHost(articleUrl)),
+      };
+    })
+      .filter((item) => item.title && item.url);
+
+    return {
+      articles: dedupeArticlesByUrl(parsed).slice(0, 60),
+    };
+  } catch (error) {
+    console.warn("naver api fetch error", { query, error: String(error?.message || error) });
+    return { articles: [] };
+  }
+}
+
+async function initNaverBudgetState(env, db) {
+  await ensureRuntimeTables(db);
+  const dailyLimit = getNaverDailyLimit(env);
+  const perRunLimit = getNaverPerRunLimit(env);
+  const day = getSeoulDayKey();
+  const usedToday = await getApiUsageDaily(db, day, NAVER_USAGE_SOURCE);
+  const remainingToday = Math.max(0, dailyLimit - usedToday);
+  const enabled = Boolean(String(env.NAVER_CLIENT_ID || "").trim() && String(env.NAVER_CLIENT_SECRET || "").trim());
+  return {
+    enabled,
+    day,
+    dailyLimit,
+    perRunLimit,
+    usedToday,
+    remainingToday,
+    usedThisRun: 0,
+    runRemaining: Math.min(perRunLimit, remainingToday),
+  };
+}
+
+async function reserveNaverCall(db, budgetState) {
+  if (!budgetState.enabled) return false;
+  if (budgetState.runRemaining <= 0) return false;
+  if (budgetState.remainingToday <= 0) return false;
+
+  await incrementApiUsageDaily(db, budgetState.day, NAVER_USAGE_SOURCE, 1);
+  budgetState.usedToday += 1;
+  budgetState.usedThisRun += 1;
+  budgetState.remainingToday = Math.max(0, budgetState.dailyLimit - budgetState.usedToday);
+  budgetState.runRemaining = Math.max(0, Math.min(
+    budgetState.perRunLimit - budgetState.usedThisRun,
+    budgetState.remainingToday,
+  ));
+  return true;
+}
+
+function getSeoulDayKey() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+function getFreshnessCutoffIso(env) {
+  const maxAgeHours = getNewsMaxAgeHours(env);
+  return new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString();
+}
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error("fetch timeout")), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runWithConcurrency(jobs, concurrency) {
+  const out = [];
+  if (!jobs.length) return out;
+  const safeConcurrency = Math.max(1, Number(concurrency || 1));
+  let next = 0;
+  const workers = new Array(Math.min(safeConcurrency, jobs.length)).fill(0).map(async () => {
+    while (next < jobs.length) {
+      const index = next;
+      next += 1;
+      const result = await jobs[index]();
+      out.push(result);
+    }
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 async function fetchManagedRssArticles(env, db) {
@@ -1975,6 +2450,62 @@ function getMaxCustomRssSourcesPerRun(env) {
   return 20;
 }
 
+function getNewsMaxAgeHours(env) {
+  const n = Number(env.NEWS_MAX_AGE_HOURS);
+  if (Number.isFinite(n) && n > 0) {
+    return Math.min(Math.max(Math.floor(n), 1), 168);
+  }
+  return 24;
+}
+
+function getGoogleFetchTimeoutMs(env) {
+  const n = Number(env.GOOGLE_FETCH_TIMEOUT_MS);
+  if (Number.isFinite(n) && n >= 1000) {
+    return Math.min(Math.floor(n), 20000);
+  }
+  return 8000;
+}
+
+function getGoogleFetchConcurrency(env) {
+  const n = Number(env.GOOGLE_FETCH_CONCURRENCY);
+  if (Number.isFinite(n) && n >= 1) {
+    return Math.min(Math.floor(n), 10);
+  }
+  return 4;
+}
+
+function getNaverDailyLimit(env) {
+  const n = Number(env.NAVER_DAILY_LIMIT);
+  if (Number.isFinite(n) && n >= 0) {
+    return Math.min(Math.floor(n), 5000);
+  }
+  return 1000;
+}
+
+function getNaverPerRunLimit(env) {
+  const n = Number(env.NAVER_PER_RUN_LIMIT);
+  if (Number.isFinite(n) && n >= 0) {
+    return Math.min(Math.floor(n), 100);
+  }
+  return 4;
+}
+
+function getRunLockTtlSeconds(env) {
+  const n = Number(env.RUN_LOCK_TTL_SECONDS);
+  if (Number.isFinite(n) && n >= 60) {
+    return Math.min(Math.floor(n), 3600);
+  }
+  return 270;
+}
+
+function getRunStaleTimeoutMinutes(env) {
+  const n = Number(env.RUN_STALE_TIMEOUT_MINUTES);
+  if (Number.isFinite(n) && n >= 5) {
+    return Math.min(Math.floor(n), 180);
+  }
+  return 15;
+}
+
 function parseKeywordConfig(row) {
   const compiledQueryRaw = collapseSpace(String(row?.query || ""));
   const parsed = safeJson(row?.exclude_terms);
@@ -2427,6 +2958,156 @@ async function ensureMediaSourcesTable(db) {
   ).run();
 
   await db.prepare("CREATE INDEX IF NOT EXISTS idx_media_sources_tier_active ON media_sources(tier, active)").run();
+}
+
+async function ensureRuntimeTables(db) {
+  await db.prepare(
+    `CREATE TABLE IF NOT EXISTS job_locks (
+      name TEXT PRIMARY KEY,
+      owner_run_id TEXT NOT NULL,
+      acquired_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    )`,
+  ).run();
+  await db.prepare("CREATE INDEX IF NOT EXISTS idx_job_locks_expires ON job_locks(expires_at)").run();
+
+  await db.prepare(
+    `CREATE TABLE IF NOT EXISTS api_usage_daily (
+      day TEXT NOT NULL,
+      source TEXT NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(day, source)
+    )`,
+  ).run();
+
+  await db.prepare(
+    `CREATE TABLE IF NOT EXISTS app_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+  ).run();
+}
+
+async function cleanupStaleRuns(db, staleTimeoutMinutes) {
+  const safeTimeout = Math.max(1, Math.floor(Number(staleTimeoutMinutes) || 15));
+  const modifier = `-${safeTimeout} minutes`;
+  const nowIso = new Date().toISOString();
+
+  const staleRuns = await db.prepare(
+    `UPDATE poll_runs
+     SET status = 'failed',
+         finished_at = ?,
+         error_message = CASE
+           WHEN error_message IS NULL OR trim(error_message) = '' THEN 'stale_timeout'
+           ELSE error_message
+         END
+     WHERE status = 'running'
+       AND datetime(started_at) < datetime('now', ?)`,
+  )
+    .bind(nowIso, modifier)
+    .run();
+
+  await db.prepare(
+    `DELETE FROM job_locks
+     WHERE datetime(expires_at) <= datetime(?)`,
+  )
+    .bind(nowIso)
+    .run();
+
+  return Number(staleRuns.meta?.changes || 0);
+}
+
+async function acquireJobLock(db, lockName, ownerRunId, ttlSeconds) {
+  const safeTtlSeconds = Math.max(30, Math.floor(Number(ttlSeconds) || 270));
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresIso = new Date(now.getTime() + safeTtlSeconds * 1000).toISOString();
+
+  await db.prepare(
+    `DELETE FROM job_locks
+     WHERE name = ?
+       AND datetime(expires_at) <= datetime(?)`,
+  )
+    .bind(lockName, nowIso)
+    .run();
+
+  const inserted = await db.prepare(
+    `INSERT INTO job_locks (name, owner_run_id, acquired_at, expires_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(name) DO NOTHING`,
+  )
+    .bind(lockName, ownerRunId, nowIso, expiresIso)
+    .run();
+
+  return Number(inserted.meta?.changes || 0) > 0;
+}
+
+async function releaseJobLock(db, lockName, ownerRunId) {
+  try {
+    await db.prepare(
+      `DELETE FROM job_locks
+       WHERE name = ? AND owner_run_id = ?`,
+    )
+      .bind(lockName, ownerRunId)
+      .run();
+  } catch (error) {
+    console.warn("failed to release job lock", { lockName, ownerRunId, error: String(error?.message || error) });
+  }
+}
+
+async function getApiUsageDaily(db, day, source) {
+  await ensureRuntimeTables(db);
+  const row = await db.prepare(
+    `SELECT used
+     FROM api_usage_daily
+     WHERE day = ? AND source = ?
+     LIMIT 1`,
+  )
+    .bind(day, source)
+    .first();
+  return Number(row?.used || 0);
+}
+
+async function incrementApiUsageDaily(db, day, source, incrementBy) {
+  const amount = Math.max(0, Math.floor(Number(incrementBy) || 0));
+  if (!amount) return;
+
+  await ensureRuntimeTables(db);
+  await db.prepare(
+    `INSERT INTO api_usage_daily (day, source, used)
+     VALUES (?, ?, ?)
+     ON CONFLICT(day, source) DO UPDATE SET
+       used = api_usage_daily.used + excluded.used`,
+  )
+    .bind(day, source, amount)
+    .run();
+}
+
+async function getAppState(db, key) {
+  await ensureRuntimeTables(db);
+  const row = await db.prepare(
+    `SELECT value
+     FROM app_state
+     WHERE key = ?
+     LIMIT 1`,
+  )
+    .bind(key)
+    .first();
+  return row?.value ?? null;
+}
+
+async function setAppState(db, key, value) {
+  await ensureRuntimeTables(db);
+  await db.prepare(
+    `INSERT INTO app_state (key, value, updated_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = datetime('now')`,
+  )
+    .bind(key, String(value || ""))
+    .run();
 }
 
 async function assertTableColumns(db, table, requiredColumns) {

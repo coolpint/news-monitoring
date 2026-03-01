@@ -108,3 +108,25 @@ CREATE TABLE IF NOT EXISTS poll_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_poll_runs_started ON poll_runs(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS job_locks (
+  name TEXT PRIMARY KEY,
+  owner_run_id TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_locks_expires ON job_locks(expires_at);
+
+CREATE TABLE IF NOT EXISTS api_usage_daily (
+  day TEXT NOT NULL,
+  source TEXT NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(day, source)
+);
+
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
